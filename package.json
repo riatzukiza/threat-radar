@@ -1,0 +1,7 @@
+{
+  "name": "threat-radar",
+  "private": true,
+  "description": "Mission Control for the News — news intelligence dashboard",
+  "license": "GPL-3.0-only",
+  "engines": { "node": ">=22" }
+}
