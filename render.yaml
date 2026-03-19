@@ -27,7 +27,6 @@ services:
     name: threat-radar-web
     runtime: static
     plan: free
-    region: oregon
     rootDir: services/threat-radar-web
     buildCommand: cd ../.. && pnpm install && pnpm --filter @workspace/radar-core build && pnpm --filter @workspace/signal-embed-browser build && cd services/threat-radar-web && npx vite build
     staticPublishPath: dist
