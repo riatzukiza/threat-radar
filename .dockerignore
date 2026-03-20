@@ -1,0 +1,10 @@
+node_modules
+.git
+.gitignore
+pnpm-store
+**/node_modules
+**/dist
+**/coverage
+**/.DS_Store
+**/.env
+receipts.log
