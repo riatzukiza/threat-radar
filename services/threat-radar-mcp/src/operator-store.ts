@@ -129,6 +129,27 @@ export class OperatorStore {
     this.sessions.delete(sessionId);
   }
 
+  async updateSession(sessionId: string, updates: Partial<Omit<OperatorSession, "id" | "createdAt">>): Promise<OperatorSession | null> {
+    const current = await this.getSession(sessionId);
+    if (!current) return null;
+
+    const next: OperatorSession = {
+      ...current,
+      ...updates,
+      id: current.id,
+      createdAt: current.createdAt,
+      updatedAt: nowIso(),
+    };
+
+    if (this.redis) {
+      await this.redis.set(sessionKey(sessionId), JSON.stringify(next), "EX", 60 * 60 * 24 * 14);
+      return next;
+    }
+
+    this.sessions.set(sessionId, next);
+    return next;
+  }
+
   async listDrafts(did: string): Promise<OperatorDraft[]> {
     if (this.redis) {
       const ids = await this.redis.smembers(draftsKey(did));

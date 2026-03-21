@@ -4,7 +4,6 @@ import {
   collectJetstream,
   createDraft,
   deleteDraft,
-  fetchBlueskyTimeline,
   fetchDrafts,
   fetchJetstreamRule,
   fetchJetstreamStatus,
@@ -15,38 +14,20 @@ import {
   updateWorkspaceConfig,
 } from "../../api/client";
 import type {
-  BlueskyTimelinePost,
   JetstreamRule,
   JetstreamStatus,
   OperatorDraft,
   OperatorSession,
   RadarTile,
-  ThreadData,
   WorkspaceConfig,
 } from "../../api/types";
-import type { SimilarityScore } from "../../embed/useEmbedding";
 
 export interface OperatorDockProps {
   readonly apiUrl: string;
   readonly session: OperatorSession;
   readonly sessionId: string;
   readonly tiles: readonly RadarTile[];
-  readonly computeSimilarity: (left: string[], right: string[]) => Promise<SimilarityScore[]>;
   readonly onLogout: () => Promise<void>;
-}
-
-function allThreads(tiles: readonly RadarTile[]): ThreadData[] {
-  return tiles.flatMap((tile) => tile.threads ?? []);
-}
-
-function blueskyWebUrl(uri: string, handle?: string): string | null {
-  if (!uri.startsWith("at://")) return null;
-  const parts = uri.slice(5).split("/");
-  if (parts.length < 3) return null;
-  const rkey = parts[2] ?? "";
-  const profile = encodeURIComponent(handle ?? parts[0] ?? "");
-  if (!rkey || !profile) return null;
-  return `https://bsky.app/profile/${profile}/post/${encodeURIComponent(rkey)}`;
 }
 
 function normalizeToken(value: string): string {
@@ -125,7 +106,7 @@ function TokenField({
   );
 }
 
-export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilarity, onLogout }: OperatorDockProps): JSX.Element {
+export function OperatorDock({ apiUrl, session, sessionId, tiles, onLogout }: OperatorDockProps): JSX.Element {
   const [drafts, setDrafts] = useState<OperatorDraft[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceConfig | null>(null);
   const [jetstreamStatus, setJetstreamStatus] = useState<JetstreamStatus | null>(null);
@@ -134,9 +115,6 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
   const [draftTitle, setDraftTitle] = useState("");
   const [draftText, setDraftText] = useState("");
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
-  const [semanticQuery, setSemanticQuery] = useState("emerging narratives");
-  const [semanticResults, setSemanticResults] = useState<Array<{ title: string; similarity: number }>>([]);
-  const [timelinePosts, setTimelinePosts] = useState<BlueskyTimelinePost[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showProxx, setShowProxx] = useState(true);
   const [userToken, setUserToken] = useState("");
@@ -149,7 +127,6 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
   const [challengeMode, setChallengeMode] = useState(true);
 
   const radarOptions = useMemo(() => tiles.map((tile) => ({ id: tile.radar.id, name: tile.radar.name })), [tiles]);
-  const threads = useMemo(() => allThreads(tiles), [tiles]);
 
   useEffect(() => {
     if (!selectedRadarId && tiles[0]?.radar.id) {
@@ -168,7 +145,6 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
       setChallengeMode(nextWorkspace.prefs.challengeMode);
     }).catch(() => {});
     void fetchJetstreamStatus(apiUrl).then(setJetstreamStatus).catch(() => {});
-    void fetchBlueskyTimeline(apiUrl, sessionId, 20).then(setTimelinePosts).catch(() => {});
   }, [apiUrl, sessionId]);
 
   useEffect(() => {
@@ -199,15 +175,6 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
     const published = await publishDraft(apiUrl, sessionId, draftText, activeDraftId ?? undefined, draftTitle || undefined);
     setStatusMessage(`Published to Bluesky: ${String(published.uri ?? "ok")}`);
     setDrafts(await fetchDrafts(apiUrl, sessionId));
-  };
-
-  const runSemanticFeed = async (): Promise<void> => {
-    if (!semanticQuery.trim() || threads.length === 0) {
-      setSemanticResults([]);
-      return;
-    }
-    const scores = await computeSimilarity([semanticQuery], threads.map((thread) => thread.title));
-    setSemanticResults(scores.slice(0, 8).map((score) => ({ title: score.localTitle, similarity: score.similarity })));
   };
 
   return (
@@ -246,44 +213,9 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
         <label className="operator-checkbox"><input type="checkbox" checked={challengeMode} onChange={(event) => setChallengeMode(event.target.checked)} /> <span>Force challenge mode: always surface counterevidence and narrative stress tests</span></label>
       </section>
 
-      <section className="operator-section">
-        <div className="operator-section-header">
-          <h3>Your Bluesky feed</h3>
-          <button className="operator-button" type="button" onClick={() => {
-            void fetchBlueskyTimeline(apiUrl, sessionId, 20)
-              .then((posts) => {
-                setTimelinePosts(posts);
-                setStatusMessage(`Loaded ${posts.length} Bluesky posts`);
-              })
-              .catch((err: unknown) => setStatusMessage(err instanceof Error ? err.message : "Failed to load Bluesky feed"));
-          }}>Refresh feed</button>
-        </div>
-        <p className="operator-hint">This is your actual subscribed Bluesky timeline, not a synthetic search result.</p>
-        <div className="operator-feed-results">
-          {timelinePosts.map((post) => {
-            const url = blueskyWebUrl(post.uri, post.author.handle);
-            return (
-              <article key={post.uri} className="operator-feed-item operator-feed-post">
-                <div className="operator-feed-post-head">
-                  <strong>{post.author.displayName ?? post.author.handle ?? "Unknown author"}</strong>
-                  <span>{post.author.handle ?? post.author.did ?? ""}</span>
-                </div>
-                <p>{post.text}</p>
-                <div className="operator-feed-post-meta">
-                  <span>{post.createdAt ? new Date(post.createdAt).toLocaleString() : ""}</span>
-                  <span>{post.replyCount ?? 0} replies</span>
-                  <span>{post.repostCount ?? 0} reposts</span>
-                  <span>{post.likeCount ?? 0} likes</span>
-                  {url && <a href={url} target="_blank" rel="noreferrer">Open post</a>}
-                </div>
-              </article>
-            );
-          })}
-          {timelinePosts.length === 0 && <p className="operator-empty">No Bluesky posts loaded yet.</p>}
-        </div>
-      </section>
-
-      <section className="operator-section">
+      <details className="operator-section operator-collapsible">
+        <summary className="operator-collapsible-summary">Advanced ingest controls</summary>
+        <div className="operator-collapsible-body">
         <h3>Jetstream rule</h3>
         <label>
           <span>Radar</span>
@@ -399,7 +331,8 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
             ))}
           </div>
         )}
-      </section>
+        </div>
+      </details>
 
       <section className="operator-section">
         <h3>Draft + post</h3>
@@ -441,22 +374,9 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
         )}
       </section>
 
-      <section className="operator-section">
-        <h3>Semantic feed preview</h3>
-        <label><span>Query</span><input value={semanticQuery} onChange={(event) => setSemanticQuery(event.target.value)} placeholder="emerging narratives" /></label>
-        <button className="operator-button operator-button-primary" onClick={() => void runSemanticFeed()}>Rank threads</button>
-        <div className="operator-feed-results">
-          {semanticResults.map((result) => (
-            <div key={`${result.title}-${result.similarity}`} className="operator-feed-item">
-              <strong>{result.title}</strong>
-              <span>{result.similarity.toFixed(2)}</span>
-            </div>
-          ))}
-          {semanticResults.length === 0 && <p className="operator-empty">Run a query to build an embedding-based feed preview from current threads.</p>}
-        </div>
-      </section>
-
-      <section className="operator-section">
+      <details className="operator-section operator-collapsible">
+        <summary className="operator-collapsible-summary">Research + tooling</summary>
+        <div className="operator-collapsible-body">
         <h3>MCP servers + Proxx</h3>
         {workspace && (
           <>
@@ -499,7 +419,8 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
             )}
           </>
         )}
-      </section>
+        </div>
+      </details>
     </aside>
   );
 }

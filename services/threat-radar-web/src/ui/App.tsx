@@ -220,7 +220,6 @@ export function App(): JSX.Element {
         session={operator.session}
         sessionId={operator.sessionId}
         tiles={tiles}
-        computeSimilarity={computeSimilarity}
         onLogout={operator.logout}
       />
       <div className="dashboard-shell">
@@ -249,7 +248,6 @@ export function App(): JSX.Element {
         )}
         <MissionBriefingPanel
           apiUrl={apiUrl}
-          session={operator.session}
           sessionId={operator.sessionId}
           tiles={tiles}
         />

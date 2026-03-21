@@ -170,11 +170,10 @@ async function loginWithBluesky(identifier: string, password: string, serviceUrl
 }
 
 async function publishDraftToBluesky(session: OperatorSession, text: string): Promise<Record<string, unknown>> {
-  const response = await fetch(`${session.serviceUrl}/xrpc/com.atproto.repo.createRecord`, {
+  const { payload } = await blueskyJsonRequest<Record<string, unknown>>(session, "/xrpc/com.atproto.repo.createRecord", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${session.accessJwt}`,
     },
     body: JSON.stringify({
       repo: session.did,
@@ -186,10 +185,7 @@ async function publishDraftToBluesky(session: OperatorSession, text: string): Pr
       },
     }),
   });
-  if (!response.ok) {
-    throw new Error(`Bluesky publish failed: ${response.status}`);
-  }
-  return response.json() as Promise<Record<string, unknown>>;
+  return payload;
 }
 
 type BlueskyTimelinePost = {
@@ -212,17 +208,7 @@ type BlueskyTimelinePost = {
 
 async function fetchBlueskyTimeline(session: OperatorSession, limit: number): Promise<BlueskyTimelinePost[]> {
   const safeLimit = Math.max(1, Math.min(100, limit));
-  const response = await fetch(`${session.serviceUrl}/xrpc/app.bsky.feed.getTimeline?limit=${safeLimit}`, {
-    headers: {
-      Authorization: `Bearer ${session.accessJwt}`,
-      Accept: "application/json",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Bluesky timeline failed: ${response.status}`);
-  }
-
-  const payload = await response.json() as {
+  const { payload } = await blueskyJsonRequest<{
     feed?: Array<{
       post?: {
         uri?: string;
@@ -253,7 +239,11 @@ async function fetchBlueskyTimeline(session: OperatorSession, limit: number): Pr
         };
       };
     }>;
-  };
+  }>(session, `/xrpc/app.bsky.feed.getTimeline?limit=${safeLimit}`, {
+    headers: {
+      Accept: "application/json",
+    },
+  });
 
   return (payload.feed ?? [])
     .map((item) => item.post)
@@ -276,6 +266,84 @@ async function fetchBlueskyTimeline(session: OperatorSession, limit: number): Pr
       externalUrl: post.embed?.external?.uri ?? post.record?.embed?.external?.uri,
     }))
     .filter((post) => post.text.length > 0);
+}
+
+function isRefreshableBlueskyError(status: number, body: string): boolean {
+  return (status === 400 || status === 401)
+    && /expired|jwt|token|auth|session/i.test(body);
+}
+
+async function refreshOperatorSession(session: OperatorSession): Promise<OperatorSession> {
+  if (!session.refreshJwt) {
+    throw new Error("Bluesky session expired and no refresh token is available");
+  }
+
+  const response = await fetch(`${session.serviceUrl}/xrpc/com.atproto.server.refreshSession`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.refreshJwt}`,
+      Accept: "application/json",
+    },
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Bluesky session refresh failed: ${response.status} ${text}`.trim());
+  }
+
+  const payload = JSON.parse(text) as {
+    accessJwt?: string;
+    refreshJwt?: string;
+    did?: string;
+    handle?: string;
+  };
+
+  const next = await operatorStore.updateSession(session.id, {
+    accessJwt: payload.accessJwt ?? session.accessJwt,
+    refreshJwt: payload.refreshJwt ?? session.refreshJwt,
+    did: payload.did ?? session.did,
+    handle: payload.handle ?? session.handle,
+    serviceUrl: session.serviceUrl,
+  });
+
+  if (!next) {
+    throw new Error("Failed to persist refreshed Bluesky session");
+  }
+
+  return next;
+}
+
+async function blueskyJsonRequest<T>(session: OperatorSession, path: string, init: RequestInit, allowRefresh = true): Promise<{ session: OperatorSession; payload: T }> {
+  const execute = async (activeSession: OperatorSession): Promise<{ response: Response; text: string; session: OperatorSession }> => {
+    const headers = new Headers(init.headers ?? {});
+    headers.set("Authorization", `Bearer ${activeSession.accessJwt}`);
+    if (!headers.has("Accept")) {
+      headers.set("Accept", "application/json");
+    }
+
+    const response = await fetch(`${activeSession.serviceUrl}${path}`, {
+      ...init,
+      headers,
+    });
+    const text = await response.text();
+    return { response, text, session: activeSession };
+  };
+
+  const first = await execute(session);
+  if (first.response.ok) {
+    return { session: first.session, payload: JSON.parse(first.text) as T };
+  }
+
+  if (allowRefresh && isRefreshableBlueskyError(first.response.status, first.text)) {
+    const refreshed = await refreshOperatorSession(session);
+    const second = await execute(refreshed);
+    if (second.response.ok) {
+      return { session: second.session, payload: JSON.parse(second.text) as T };
+    }
+    throw new Error(`Bluesky request failed after refresh: ${second.response.status} ${second.text}`.trim());
+  }
+
+  throw new Error(`Bluesky request failed: ${first.response.status} ${first.text}`.trim());
 }
 
 let store: PostgresRadarStore | InMemoryRadarStore;

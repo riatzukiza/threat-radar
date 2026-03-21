@@ -1,14 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { fetchBlueskyTimeline, fetchSignalFeed, fetchWorkspaceConfig } from "../../api/client";
-import type { BlueskyTimelinePost, OperatorSession, RadarTile, SignalFeedItem, WorkspaceConfig } from "../../api/types";
+import type { BlueskyTimelinePost, RadarTile, SignalFeedItem, WorkspaceConfig } from "../../api/types";
 import { buildNarrativeCandidates, deriveStrategyLines, extractGeoHotspots } from "../objective-engine";
 
 export interface MissionBriefingPanelProps {
   readonly apiUrl: string;
-  readonly session: OperatorSession;
   readonly sessionId: string;
   readonly tiles: readonly RadarTile[];
+}
+
+function blueskyWebUrl(uri: string, handle?: string): string | null {
+  if (!uri.startsWith("at://")) return null;
+  const parts = uri.slice(5).split("/");
+  if (parts.length < 3) return null;
+  const rkey = parts[2] ?? "";
+  const profile = encodeURIComponent(handle ?? parts[0] ?? "");
+  if (!rkey || !profile) return null;
+  return `https://bsky.app/profile/${profile}/post/${encodeURIComponent(rkey)}`;
 }
 
 function worldX(lon: number, width: number): number {
@@ -19,7 +28,7 @@ function worldY(lat: number, height: number): number {
   return ((90 - lat) / 180) * height;
 }
 
-export function MissionBriefingPanel({ apiUrl, session, sessionId, tiles }: MissionBriefingPanelProps): JSX.Element {
+export function MissionBriefingPanel({ apiUrl, sessionId, tiles }: MissionBriefingPanelProps): JSX.Element {
   const [workspace, setWorkspace] = useState<WorkspaceConfig | null>(null);
   const [signals, setSignals] = useState<SignalFeedItem[]>([]);
   const [posts, setPosts] = useState<BlueskyTimelinePost[]>([]);
@@ -138,6 +147,35 @@ export function MissionBriefingPanel({ apiUrl, session, sessionId, tiles }: Miss
           </div>
         </section>
       </div>
+
+      <section className="mission-card mission-card-feed">
+        <div className="mission-card-header">
+          <h3>Bluesky home feed</h3>
+          <span>Actual subscribed posts, used as source-native evidence</span>
+        </div>
+        <div className="mission-feed-list">
+          {posts.slice(0, 6).map((post) => {
+            const url = blueskyWebUrl(post.uri, post.author.handle);
+            return (
+              <article key={post.uri} className="mission-feed-post">
+                <div className="mission-feed-post-head">
+                  <strong>{post.author.displayName ?? post.author.handle ?? "Unknown author"}</strong>
+                  <span>{post.author.handle ?? post.author.did ?? ""}</span>
+                </div>
+                <p>{post.text}</p>
+                <div className="mission-feed-post-meta">
+                  <span>{post.createdAt ? new Date(post.createdAt).toLocaleString() : ""}</span>
+                  <span>{post.replyCount ?? 0} replies</span>
+                  <span>{post.repostCount ?? 0} reposts</span>
+                  <span>{post.likeCount ?? 0} likes</span>
+                  {url && <a href={url} target="_blank" rel="noreferrer">Open post</a>}
+                </div>
+              </article>
+            );
+          })}
+          {posts.length === 0 && <p className="mission-empty">No Bluesky posts loaded yet.</p>}
+        </div>
+      </section>
 
       <section className="mission-card mission-card-narratives">
         <div className="mission-card-header">

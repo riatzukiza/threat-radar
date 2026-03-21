@@ -293,6 +293,32 @@ body {
   margin-bottom: 4px;
 }
 
+.operator-collapsible summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.operator-collapsible summary::-webkit-details-marker {
+  display: none;
+}
+
+.operator-collapsible-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.operator-collapsible-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
 .operator-section-header {
   display: flex;
   align-items: center;
@@ -607,7 +633,8 @@ body {
 
 .mission-strategy-lines,
 .mission-hotspot-list,
-.mission-narrative-list {
+.mission-narrative-list,
+.mission-feed-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -661,6 +688,47 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.mission-feed-post {
+  background: rgba(255,255,255,0.025);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 14px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mission-feed-post-head,
+.mission-feed-post-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: baseline;
+}
+
+.mission-feed-post-head strong,
+.mission-feed-post p,
+.mission-feed-post-meta a {
+  color: var(--ink);
+}
+
+.mission-feed-post-head span,
+.mission-feed-post-meta span,
+.mission-feed-post-meta a {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mission-feed-post p {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.mission-feed-post-meta a {
+  color: var(--cyan);
+  text-decoration: none;
 }
 
 .mission-support-chip {
