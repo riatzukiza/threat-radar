@@ -10,7 +10,7 @@ import { RiskGauge } from "./RiskGauge";
 import { BranchMap } from "./BranchMap";
 import type { BranchMapBranch } from "./BranchMap";
 import { EtaThreadCard } from "./EtaThreadCard";
-import type { RadarTile, ThreadData, DeterministicSnapshotData, SignalData } from "../../api/types";
+import type { RadarTile, ThreadData, DeterministicSnapshotData, SignalData, LatestSubmissionData, SubmissionSourceData } from "../../api/types";
 import { normalizeDimension } from "../hooks/usePersonalization";
 import type { DimensionWeights } from "../hooks/usePersonalization";
 
@@ -57,6 +57,38 @@ function toBranchMapBranches(det: DeterministicSnapshotData): BranchMapBranch[] 
   }));
 }
 
+function displayLabel(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
+function signalCountForTile(tile: RadarTile): number {
+  if (typeof tile.signalCount === "number") return tile.signalCount;
+  return (tile.threads ?? []).reduce((sum, thread) => sum + thread.members.length, 0);
+}
+
+function signalEntries(submission: LatestSubmissionData | undefined): Array<[string, LatestSubmissionData["signal_scores"][string]]> {
+  if (!submission) return [];
+  return Object.entries(submission.signal_scores)
+    .sort((a, b) => {
+      const valueDiff = b[1].value - a[1].value;
+      if (valueDiff !== 0) return valueDiff;
+      return b[1].confidence - a[1].confidence;
+    });
+}
+
+function resolveSupportingSources(score: LatestSubmissionData["signal_scores"][string], sources: readonly SubmissionSourceData[]): SubmissionSourceData[] {
+  if (score.supporting_sources.length === 0) return [];
+  const byNote = new Map<string, SubmissionSourceData>();
+  for (const source of sources) {
+    if (source.notes) {
+      byNote.set(source.notes, source);
+    }
+  }
+  return score.supporting_sources
+    .map((key) => byNote.get(key))
+    .filter((source): source is SubmissionSourceData => source !== undefined);
+}
+
 /** Merge source distributions from all threads to get overall source counts */
 function aggregateSourceCounts(threads: ThreadData[]): Record<string, number> {
   const result: Record<string, number> = {};
@@ -95,6 +127,11 @@ function EtaRadarSection({ tile, weights }: { tile: RadarTile; weights?: Dimensi
 
   // Score ranges from deterministic reducer for per-dimension gauges
   const scoreRanges = det?.scoreRanges ?? [];
+  const latestSubmission = tile.latestSubmission;
+  const submissionSignals = signalEntries(latestSubmission);
+  const totalSignalCount = signalCountForTile(tile);
+  const sourceRefs = latestSubmission?.sourceCount ?? 0;
+  const singlePacket = tile.submissionCount <= 1;
 
   return (
     <div className="eta-radar-section" data-testid="eta-radar-section">
@@ -113,6 +150,86 @@ function EtaRadarSection({ tile, weights }: { tile: RadarTile; weights?: Dimensi
         size={200}
         className="sweep-clock"
       />
+
+      <div className="eta-clock-explain" data-testid="eta-clock-explain">
+        <div className="eta-clock-explain-header">
+          <strong>Why {overallThreat.toFixed(1)} / 4</strong>
+          <span>{totalSignalCount} collected signals · {tile.submissionCount} assessment packet{tile.submissionCount !== 1 ? "s" : ""}</span>
+        </div>
+        {singlePacket && (
+          <div className="eta-honesty-banner" data-testid="eta-honesty-banner">
+            Single-packet view: this clock currently reflects one assessment packet, not multi-model consensus yet.
+          </div>
+        )}
+        {latestSubmission && (
+          <div className="eta-assessment-basis" data-testid="eta-assessment-basis">
+            <div className="eta-assessment-meta">
+              <span><strong>Model:</strong> {latestSubmission.model_id}</span>
+              <span><strong>As of:</strong> {new Date(latestSubmission.timestamp_utc).toLocaleString()}</span>
+              <span><strong>Source refs:</strong> {sourceRefs}</span>
+            </div>
+
+            {submissionSignals.length > 0 && (
+              <div className="eta-assessment-block">
+                <div className="eta-assessment-block-title">Driving signal scores</div>
+                <div className="eta-assessment-list">
+                  {submissionSignals.slice(0, 4).map(([signalId, score]) => {
+                    const supporting = resolveSupportingSources(score, latestSubmission.sources);
+                    return (
+                      <div key={signalId} className="eta-assessment-item" data-testid="eta-assessment-item">
+                        <div className="eta-assessment-item-head">
+                          <strong>{displayLabel(signalId)}</strong>
+                          <span>{score.value}/4 · range {score.range[0]}–{score.range[1]} · {(score.confidence * 100).toFixed(0)}% confidence</span>
+                        </div>
+                        <p>{score.reason}</p>
+                        {supporting.length > 0 && (
+                          <div className="eta-assessment-supporting">
+                            {supporting.slice(0, 3).map((source) => (
+                              source.url ? (
+                                <a key={`${signalId}-${source.name}`} href={source.url} target="_blank" rel="noreferrer">{source.name}</a>
+                              ) : (
+                                <span key={`${signalId}-${source.name}`}>{source.name}</span>
+                              )
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {latestSubmission.sources.length > 0 && (
+              <div className="eta-assessment-block">
+                <div className="eta-assessment-block-title">Evidence base</div>
+                <div className="eta-source-reference-list">
+                  {latestSubmission.sources.slice(0, 6).map((source) => (
+                    <div key={`${source.name}-${source.url ?? source.notes ?? "ref"}`} className="eta-source-reference">
+                      <strong>{source.name}</strong>
+                      <span>{source.type} · {(source.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {latestSubmission.uncertainties.length > 0 && (
+              <div className="eta-assessment-block">
+                <div className="eta-assessment-block-title">Known uncertainty</div>
+                <div className="eta-uncertainty-list">
+                  {latestSubmission.uncertainties.map((uncertainty) => (
+                    <div key={`${uncertainty.category}-${uncertainty.description}`} className="eta-uncertainty-item">
+                      <strong>{uncertainty.category}</strong>
+                      <p>{uncertainty.description}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* RiskGauges — one per dimension, showing score RANGES (weighted) */}
       {scoreRanges.length > 0 && (

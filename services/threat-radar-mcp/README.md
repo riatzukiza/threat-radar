@@ -2,7 +2,7 @@
 
 MCP control plane and REST API for the threat-radar platform — a news intelligence system that expresses nuance, preserves user agency, and resists mental model collapse.
 
-Collects signals from Bluesky and Reddit, normalizes and clusters them into threads, reduces assessment packets into live snapshots, and exposes everything via 10 MCP tools plus a REST API.
+Collects signals from Bluesky, Reddit, Jetstream-backed Bluesky firehose windows, and the Fork Tales crawler/weaver, normalizes and clusters them into threads, reduces assessment packets into live snapshots, and exposes everything via the MCP control plane plus a REST API.
 
 ## Setup
 
@@ -54,6 +54,9 @@ Listens on `http://0.0.0.0:9001` by default.
 | `radar_get_audit_log` | Get audit events for a radar |
 | `radar_collect_bluesky` | Collect signals from Bluesky public feeds |
 | `radar_collect_reddit` | Collect signals from Reddit subreddits |
+| `radar_set_jetstream_rule` | Configure Jetstream firehose filters and Redis windowing for a radar |
+| `radar_collect_jetstream` | Collect normalized signals from the Jetstream rolling window |
+| `radar_collect_weaver` | Collect signals from the Fork Tales web graph weaver |
 | `radar_cluster_signals` | Cluster signals into threads via TF-IDF similarity |
 
 MCP endpoint: `POST /mcp` (Streamable HTTP transport)
@@ -67,6 +70,11 @@ MCP endpoint: `POST /mcp` (Streamable HTTP transport)
 | `POST` | `/api/radars` | Admin | Create a radar |
 | `POST` | `/api/submit-packet` | Admin | Submit assessment packet |
 | `POST` | `/api/reduce-live/:radarId` | Admin | Reduce live snapshot |
+| `GET` | `/api/jetstream/status` | No | Show Jetstream subscriber status |
+| `GET/PUT/DELETE` | `/api/jetstream/rules/:radarId` | Admin | Read/write Jetstream rule for a radar |
+| `GET` | `/api/jetstream/rules` | Admin | List all Jetstream rules |
+| `POST` | `/api/collect/jetstream` | Admin | Collect signals from Redis-backed Jetstream window |
+| `POST` | `/api/collect/weaver` | Admin | Collect crawler/weaver signals |
 | `GET` | `/api/federation/status` | No | Federation node status |
 | `GET` | `/api/federation/peers` | No | List federation peers |
 | `POST` | `/api/federation/receive` | No | Receive federated data |

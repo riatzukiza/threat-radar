@@ -334,6 +334,24 @@ async function startTestServer(): Promise<{ server: http.Server; close: () => Pr
     },
   );
 
+  mcpServer.registerTool(
+    "radar_collect_weaver",
+    {
+      description: "Collect signals from the Fork Tales web graph weaver.",
+      inputSchema: {
+        baseUrl: z.string().optional(),
+        domainAllowlist: z.array(z.string().min(1)).optional(),
+        keywords: z.array(z.string().min(1)).optional(),
+        domainSignalLimit: z.number().int().min(1).max(25).optional(),
+        recentNodeLimit: z.number().int().min(0).max(50).optional(),
+        graphNodeLimit: z.number().int().min(50).max(5000).optional(),
+      },
+    },
+    async () => {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, collected: 2, duplicates: 0, total_fetched: 2 }) }] };
+    },
+  );
+
   const mcpRouter = createMcpHttpRouter({ createServer: () => mcpServer });
 
   const app = express();
@@ -468,7 +486,7 @@ async function callTool(sessionId: string, name: string, args: Record<string, un
 
 // ─── Tests ──────────────────────────────────────────────────────────────────────
 
-describe("mcp-tool-completeness: all 9 MCP tools", () => {
+describe("mcp-tool-completeness: all 10 MCP tools", () => {
   let sessionId: string;
   let testRadarId: string;
 
@@ -627,6 +645,21 @@ describe("mcp-tool-completeness: all 9 MCP tools", () => {
       subreddits: ["machinelearning"],
       sort: "hot",
       limit: 5,
+    });
+    expect(isError).toBe(false);
+    const data = result as { ok: boolean; collected: number; duplicates: number; total_fetched: number };
+    expect(data.ok).toBe(true);
+    expect(typeof data.collected).toBe("number");
+    expect(typeof data.total_fetched).toBe("number");
+  });
+
+  // ── Tool 10: radar_collect_weaver ─────────────────────────────────────────
+  it("mcp-tool: radar_collect_weaver returns well-formed response", async () => {
+    const { result, isError } = await callTool(sessionId, "radar_collect_weaver", {
+      baseUrl: "http://127.0.0.1:8793",
+      domainAllowlist: ["iea.org"],
+      keywords: ["hormuz"],
+      recentNodeLimit: 2,
     });
     expect(isError).toBe(false);
     const data = result as { ok: boolean; collected: number; duplicates: number; total_fetched: number };

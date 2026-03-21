@@ -45,6 +45,41 @@ function makeRadarTile(overrides: Partial<RadarTile> = {}): RadarTile {
     },
     sourceCount: 3,
     submissionCount: 5,
+    latestSubmission: {
+      timestamp_utc: "2024-01-01T11:30:00Z",
+      model_id: "energy-assessor-v1",
+      model_version: "1.0.0",
+      sourceCount: 2,
+      sources: [
+        { type: "official", name: "IEA", url: "https://iea.org/example", confidence: 0.9, notes: "iea-1" },
+        { type: "news", name: "Reuters", url: "https://reuters.com/example", confidence: 0.8, notes: "reuters-1" },
+      ],
+      signal_scores: {
+        geopolitical_tension: {
+          value: 3,
+          range: [2, 4],
+          confidence: 0.76,
+          reason: "Military signaling and route warnings increased regional tension.",
+          supporting_sources: ["iea-1", "reuters-1"],
+        },
+        infrastructure_stress: {
+          value: 2,
+          range: [1, 3],
+          confidence: 0.68,
+          reason: "Shipping and terminal reports imply moderate infrastructure strain.",
+          supporting_sources: ["reuters-1"],
+        },
+      },
+      branch_assessment: [],
+      uncertainties: [
+        {
+          category: "model",
+          description: "This is still a heuristic packet, not a multi-model consensus.",
+          impact: "moderate",
+        },
+      ],
+      calibration_notes: "Test packet",
+    },
     liveSnapshot: {
       as_of_utc: "2024-01-01T12:00:00Z",
       disagreement_index: 0.3,
@@ -241,6 +276,20 @@ describe("EtaLaneContent", () => {
     const tile = makeRadarTile();
     render(<EtaLaneContent tiles={[tile]} />);
     expect(screen.getByText("Narrative Branches")).toBeDefined();
+  });
+
+  it("shows assessment basis and signal reasons when latest submission is present", () => {
+    const tile = makeRadarTile();
+    render(<EtaLaneContent tiles={[tile]} />);
+    expect(screen.getByTestId("eta-assessment-basis")).toBeDefined();
+    expect(screen.getByText(/Military signaling and route warnings increased regional tension/i)).toBeDefined();
+    expect(screen.getByText("Evidence base")).toBeDefined();
+  });
+
+  it("shows an honesty banner when only one assessment packet exists", () => {
+    const tile = makeRadarTile({ submissionCount: 1 });
+    render(<EtaLaneContent tiles={[tile]} />);
+    expect(screen.getByTestId("eta-honesty-banner").textContent).toContain("Single-packet view");
   });
 
   it("renders multiple tiles", () => {
