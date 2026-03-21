@@ -14,6 +14,7 @@ import { CriticalThinkingSection } from "./components/CriticalThinkingSection";
 import { ActionFeed } from "./components/ActionFeed";
 import { FirehosePanel } from "./components/FirehosePanel";
 import { HeroPanel } from "./components/HeroPanel";
+import { MissionBriefingPanel } from "./components/MissionBriefingPanel";
 import { OperatorDock } from "./components/OperatorDock";
 import { OperatorLoginGate } from "./components/OperatorLoginGate";
 import { useRadarPolling } from "../api/useRadarPolling";
@@ -246,6 +247,12 @@ export function App(): JSX.Element {
         {!loading && tiles.length > 0 && (
           <HeroPanel tiles={tiles} />
         )}
+        <MissionBriefingPanel
+          apiUrl={apiUrl}
+          session={operator.session}
+          sessionId={operator.sessionId}
+          tiles={tiles}
+        />
         {/* Placeholder hero panel when loading or no data */}
         {!loading && tiles.length === 0 && !error ? null : loading ? (
           <HeroPanel tiles={[]} />

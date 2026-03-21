@@ -216,6 +216,10 @@ export type WorkspacePrefs = {
   did: string;
   enabledServerIds: string[];
   proxxDocked: boolean;
+  objective: string;
+  longTermObjective: string;
+  strategicNotes: string;
+  challengeMode: boolean;
   updatedAt: string;
 };
 

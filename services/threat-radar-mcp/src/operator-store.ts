@@ -28,6 +28,10 @@ export interface OperatorWorkspacePrefs {
   did: string;
   enabledServerIds: string[];
   proxxDocked: boolean;
+  objective: string;
+  longTermObjective: string;
+  strategicNotes: string;
+  challengeMode: boolean;
   updatedAt: string;
 }
 
@@ -49,6 +53,19 @@ function draftKey(did: string, draftId: string): string {
 
 function prefsKey(did: string): string {
   return `threat-radar:operator:prefs:${did}`;
+}
+
+function normalizePrefs(input: Partial<OperatorWorkspacePrefs> & { did: string }): OperatorWorkspacePrefs {
+  return {
+    did: input.did,
+    enabledServerIds: [...new Set(input.enabledServerIds ?? ["proxx", "radar-mcp", "jetstream", "mnemosyne", "mcp-github"])].sort(),
+    proxxDocked: input.proxxDocked ?? true,
+    objective: input.objective ?? "",
+    longTermObjective: input.longTermObjective ?? "",
+    strategicNotes: input.strategicNotes ?? "",
+    challengeMode: input.challengeMode ?? true,
+    updatedAt: input.updatedAt ?? nowIso(),
+  };
 }
 
 export class OperatorStore {
@@ -178,28 +195,26 @@ export class OperatorStore {
     if (this.redis) {
       const raw = await this.redis.get(prefsKey(did));
       if (raw) {
-        return JSON.parse(raw) as OperatorWorkspacePrefs;
+        return normalizePrefs(JSON.parse(raw) as Partial<OperatorWorkspacePrefs> & { did: string });
       }
     } else {
       const current = this.prefs.get(did);
       if (current) return current;
     }
 
-    return {
+    return normalizePrefs({
       did,
-      enabledServerIds: ["proxx", "radar-mcp", "jetstream", "mnemosyne", "mcp-github"],
-      proxxDocked: true,
-      updatedAt: nowIso(),
-    };
+    });
   }
 
-  async setPrefs(did: string, input: Pick<OperatorWorkspacePrefs, "enabledServerIds" | "proxxDocked">): Promise<OperatorWorkspacePrefs> {
-    const next: OperatorWorkspacePrefs = {
+  async setPrefs(did: string, input: Partial<Pick<OperatorWorkspacePrefs, "enabledServerIds" | "proxxDocked" | "objective" | "longTermObjective" | "strategicNotes" | "challengeMode">>): Promise<OperatorWorkspacePrefs> {
+    const current = await this.getPrefs(did);
+    const next: OperatorWorkspacePrefs = normalizePrefs({
+      ...current,
+      ...input,
       did,
-      enabledServerIds: [...new Set(input.enabledServerIds)].sort(),
-      proxxDocked: input.proxxDocked,
       updatedAt: nowIso(),
-    };
+    });
 
     if (this.redis) {
       await this.redis.set(prefsKey(did), JSON.stringify(next), "EX", 60 * 60 * 24 * 30);

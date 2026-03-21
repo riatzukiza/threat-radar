@@ -1314,8 +1314,12 @@ app.put("/api/operator/workspace", requireOperatorSession, async (req, res) => {
   try {
     const session = operatorSessionOf(req);
     const body = z.object({
-      enabledServerIds: z.array(z.string().min(1)),
-      proxxDocked: z.boolean(),
+      enabledServerIds: z.array(z.string().min(1)).optional(),
+      proxxDocked: z.boolean().optional(),
+      objective: z.string().max(2000).optional(),
+      longTermObjective: z.string().max(2000).optional(),
+      strategicNotes: z.string().max(4000).optional(),
+      challengeMode: z.boolean().optional(),
     }).parse(req.body);
     const prefs = await operatorStore.setPrefs(session.did, body);
     res.json({ ok: true, prefs });

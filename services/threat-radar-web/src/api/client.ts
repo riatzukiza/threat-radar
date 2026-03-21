@@ -164,7 +164,7 @@ export async function fetchWorkspaceConfig(apiUrl: string, sessionId: string): P
   return data.workspace;
 }
 
-export async function updateWorkspaceConfig(apiUrl: string, sessionId: string, prefs: Pick<WorkspacePrefs, "enabledServerIds" | "proxxDocked">): Promise<WorkspacePrefs> {
+export async function updateWorkspaceConfig(apiUrl: string, sessionId: string, prefs: Partial<Pick<WorkspacePrefs, "enabledServerIds" | "proxxDocked" | "objective" | "longTermObjective" | "strategicNotes" | "challengeMode">>): Promise<WorkspacePrefs> {
   const data = await fetchJson<{ ok: true; prefs: WorkspacePrefs }>(`${apiUrl}/api/operator/workspace`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...operatorHeaders(sessionId) },
