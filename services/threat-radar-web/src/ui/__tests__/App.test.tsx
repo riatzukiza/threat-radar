@@ -91,6 +91,10 @@ vi.mock("../components/HeroPanel", () => ({
   HeroPanel: () => <div data-testid="hero-panel">hero</div>,
 }));
 
+vi.mock("../components/MissionBriefingPanel", () => ({
+  MissionBriefingPanel: () => <div data-testid="mission-briefing-panel">briefing</div>,
+}));
+
 vi.mock("../components/LoadingSkeleton", () => ({
   LoadingSkeleton: () => <div data-testid="loading-skeleton">loading</div>,
 }));

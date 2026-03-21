@@ -143,6 +143,10 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
   const [didToken, setDidToken] = useState("");
   const [hashtagToken, setHashtagToken] = useState("");
   const [keywordToken, setKeywordToken] = useState("");
+  const [objective, setObjective] = useState("");
+  const [longTermObjective, setLongTermObjective] = useState("");
+  const [strategicNotes, setStrategicNotes] = useState("");
+  const [challengeMode, setChallengeMode] = useState(true);
 
   const radarOptions = useMemo(() => tiles.map((tile) => ({ id: tile.radar.id, name: tile.radar.name })), [tiles]);
   const threads = useMemo(() => allThreads(tiles), [tiles]);
@@ -158,6 +162,10 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
     void fetchWorkspaceConfig(apiUrl, sessionId).then((nextWorkspace) => {
       setWorkspace(nextWorkspace);
       setShowProxx(nextWorkspace.prefs.proxxDocked);
+      setObjective(nextWorkspace.prefs.objective);
+      setLongTermObjective(nextWorkspace.prefs.longTermObjective);
+      setStrategicNotes(nextWorkspace.prefs.strategicNotes);
+      setChallengeMode(nextWorkspace.prefs.challengeMode);
     }).catch(() => {});
     void fetchJetstreamStatus(apiUrl).then(setJetstreamStatus).catch(() => {});
     void fetchBlueskyTimeline(apiUrl, sessionId, 20).then(setTimelinePosts).catch(() => {});
@@ -216,6 +224,27 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, computeSimilar
       </div>
 
       {statusMessage && <div className="operator-status-banner">{statusMessage}</div>}
+
+      <section className="operator-section">
+        <div className="operator-section-header">
+          <h3>Objective</h3>
+          <button className="operator-button operator-button-primary" type="button" onClick={() => {
+            void updateWorkspaceConfig(apiUrl, sessionId, {
+              objective,
+              longTermObjective,
+              strategicNotes,
+              challengeMode,
+            }).then((prefs) => {
+              setWorkspace((current) => current ? { ...current, prefs } : current);
+              setStatusMessage("Objective saved");
+            }).catch((err: unknown) => setStatusMessage(err instanceof Error ? err.message : "Failed to save objective"));
+          }}>Save objective</button>
+        </div>
+        <label><span>Immediate objective</span><textarea value={objective} onChange={(event) => setObjective(event.target.value)} rows={3} placeholder="What change do you want to see in the world?" /></label>
+        <label><span>Long-term direction</span><textarea value={longTermObjective} onChange={(event) => setLongTermObjective(event.target.value)} rows={3} placeholder="What structural change should this lead to?" /></label>
+        <label><span>Strategic notes / tensions</span><textarea value={strategicNotes} onChange={(event) => setStrategicNotes(event.target.value)} rows={4} placeholder="Capture tradeoffs, complications, and what should challenge the narrative." /></label>
+        <label className="operator-checkbox"><input type="checkbox" checked={challengeMode} onChange={(event) => setChallengeMode(event.target.checked)} /> <span>Force challenge mode: always surface counterevidence and narrative stress tests</span></label>
+      </section>
 
       <section className="operator-section">
         <div className="operator-section-header">
