@@ -32,6 +32,9 @@ import { getSql, initSchema, closeSql } from "./lib/postgres.js";
 import { PostgresRadarStore } from "./store.js";
 import { BlueskyCollector, type BlueskyFeedQuery } from "./collectors/bluesky.js";
 import { RedditCollector } from "./collectors/reddit.js";
+import { WeaverCollector } from "./collectors/weaver.js";
+import { collectJetstreamWindowSignals, JetstreamService, type JetstreamRule, type JetstreamRuleInput } from "./jetstream.js";
+import { OperatorStore, type OperatorSession, type OperatorDraft } from "./operator-store.js";
 import {
   FederationManager,
   createAggregatePayload,
@@ -46,13 +49,45 @@ const ENV = z.object({
   ADMIN_AUTH_KEY: z.string().min(12),
   ALLOW_UNAUTH_LOCAL: z.string().optional(),
   DATABASE_URL: z.string().optional(),
+  REDIS_URL: z.string().optional(),
+  JETSTREAM_ENABLED: z.string().optional(),
+  JETSTREAM_URL: z.string().url().optional(),
+  ATPROTO_SERVICE: z.string().url().optional(),
+  PROXX_BASE_URL: z.string().url().optional(),
 }).parse(process.env);
 
 const publicBaseUrl = new URL(ENV.PUBLIC_BASE_URL ?? process.env.RENDER_EXTERNAL_URL ?? `http://127.0.0.1:${ENV.PORT}`);
 const usePostgres = Boolean(ENV.DATABASE_URL);
+const jetstreamEnabled = toBool(ENV.JETSTREAM_ENABLED, true) && Boolean(ENV.REDIS_URL);
+const proxxBaseUrl = ENV.PROXX_BASE_URL ?? "https://ussy.promethean.rest";
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function latestSubmissionView(packet: RadarAssessmentPacket | undefined): {
+  timestamp_utc: string;
+  model_id: string;
+  model_version?: string;
+  sourceCount: number;
+  sources: RadarAssessmentPacket["sources"];
+  signal_scores: RadarAssessmentPacket["signal_scores"];
+  branch_assessment: RadarAssessmentPacket["branch_assessment"];
+  uncertainties: RadarAssessmentPacket["uncertainties"];
+  calibration_notes?: string;
+} | undefined {
+  if (!packet) return undefined;
+  return {
+    timestamp_utc: packet.timestamp_utc,
+    model_id: packet.model_id,
+    model_version: packet.model_version,
+    sourceCount: packet.sources.length,
+    sources: packet.sources,
+    signal_scores: packet.signal_scores,
+    branch_assessment: packet.branch_assessment,
+    uncertainties: packet.uncertainties,
+    calibration_notes: packet.calibration_notes,
+  };
 }
 
 function toBool(value: string | undefined, fallback: boolean): boolean {
@@ -83,8 +118,252 @@ function requireAdminKey(req: express.Request, res: express.Response, next: expr
   res.status(401).json({ error: "Unauthorized" });
 }
 
+async function requireOperatorSession(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> {
+  const sessionId = String(req.headers["x-operator-session"] ?? "").trim();
+  if (!sessionId) {
+    res.status(401).json({ ok: false, error: "Operator session required" });
+    return;
+  }
+  const session = await operatorStore.getSession(sessionId);
+  if (!session) {
+    res.status(401).json({ ok: false, error: "Invalid operator session" });
+    return;
+  }
+  (req as express.Request & { operatorSession?: OperatorSession }).operatorSession = session;
+  next();
+}
+
+function operatorSessionOf(req: express.Request): OperatorSession {
+  const session = (req as express.Request & { operatorSession?: OperatorSession }).operatorSession;
+  if (!session) {
+    throw new Error("Operator session missing from request context");
+  }
+  return session;
+}
+
+async function loginWithBluesky(identifier: string, password: string, serviceUrl?: string): Promise<OperatorSession> {
+  const service = (serviceUrl?.trim() || "https://bsky.social").replace(/\/$/, "");
+  const response = await fetch(`${service}/xrpc/com.atproto.server.createSession`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier, password }),
+  });
+  if (!response.ok) {
+    throw new Error(`Bluesky login failed: ${response.status}`);
+  }
+  const payload = await response.json() as {
+    did?: string;
+    handle?: string;
+    accessJwt?: string;
+    refreshJwt?: string;
+  };
+  if (!payload.did || !payload.accessJwt) {
+    throw new Error("Bluesky login response incomplete");
+  }
+  return operatorStore.createSession({
+    did: payload.did,
+    handle: payload.handle ?? identifier,
+    accessJwt: payload.accessJwt,
+    refreshJwt: payload.refreshJwt,
+    serviceUrl: service,
+  });
+}
+
+async function publishDraftToBluesky(session: OperatorSession, text: string): Promise<Record<string, unknown>> {
+  const { payload } = await blueskyJsonRequest<Record<string, unknown>>(session, "/xrpc/com.atproto.repo.createRecord", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      repo: session.did,
+      collection: "app.bsky.feed.post",
+      record: {
+        $type: "app.bsky.feed.post",
+        text,
+        createdAt: new Date().toISOString(),
+      },
+    }),
+  });
+  return payload;
+}
+
+type BlueskyTimelinePost = {
+  uri: string;
+  author: {
+    did?: string;
+    handle?: string;
+    displayName?: string;
+    avatar?: string;
+  };
+  text: string;
+  createdAt?: string;
+  replyCount?: number;
+  repostCount?: number;
+  likeCount?: number;
+  quoteCount?: number;
+  labels?: string[];
+  externalUrl?: string;
+};
+
+async function fetchBlueskyTimeline(session: OperatorSession, limit: number): Promise<BlueskyTimelinePost[]> {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const { payload } = await blueskyJsonRequest<{
+    feed?: Array<{
+      post?: {
+        uri?: string;
+        author?: {
+          did?: string;
+          handle?: string;
+          displayName?: string;
+          avatar?: string;
+        };
+        record?: {
+          text?: string;
+          createdAt?: string;
+          embed?: {
+            external?: {
+              uri?: string;
+            };
+          };
+        };
+        replyCount?: number;
+        repostCount?: number;
+        likeCount?: number;
+        quoteCount?: number;
+        labels?: Array<{ val?: string }>;
+        embed?: {
+          external?: {
+            uri?: string;
+          };
+        };
+      };
+    }>;
+  }>(session, `/xrpc/app.bsky.feed.getTimeline?limit=${safeLimit}`, {
+    headers: {
+      Accept: "application/json",
+    },
+  });
+
+  return (payload.feed ?? [])
+    .map((item) => item.post)
+    .filter((post): post is NonNullable<typeof post> => Boolean(post?.uri))
+    .map((post) => ({
+      uri: post.uri ?? "",
+      author: {
+        did: post.author?.did,
+        handle: post.author?.handle,
+        displayName: post.author?.displayName,
+        avatar: post.author?.avatar,
+      },
+      text: String(post.record?.text ?? "").trim(),
+      createdAt: post.record?.createdAt,
+      replyCount: post.replyCount,
+      repostCount: post.repostCount,
+      likeCount: post.likeCount,
+      quoteCount: post.quoteCount,
+      labels: (post.labels ?? []).map((label) => label.val).filter((value): value is string => typeof value === "string"),
+      externalUrl: post.embed?.external?.uri ?? post.record?.embed?.external?.uri,
+    }))
+    .filter((post) => post.text.length > 0);
+}
+
+function isRefreshableBlueskyError(status: number, body: string): boolean {
+  return (status === 400 || status === 401)
+    && /expired|jwt|token|auth|session/i.test(body);
+}
+
+async function refreshOperatorSession(session: OperatorSession): Promise<OperatorSession> {
+  if (!session.refreshJwt) {
+    throw new Error("Bluesky session expired and no refresh token is available");
+  }
+
+  const response = await fetch(`${session.serviceUrl}/xrpc/com.atproto.server.refreshSession`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.refreshJwt}`,
+      Accept: "application/json",
+    },
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Bluesky session refresh failed: ${response.status} ${text}`.trim());
+  }
+
+  const payload = JSON.parse(text) as {
+    accessJwt?: string;
+    refreshJwt?: string;
+    did?: string;
+    handle?: string;
+  };
+
+  const next = await operatorStore.updateSession(session.id, {
+    accessJwt: payload.accessJwt ?? session.accessJwt,
+    refreshJwt: payload.refreshJwt ?? session.refreshJwt,
+    did: payload.did ?? session.did,
+    handle: payload.handle ?? session.handle,
+    serviceUrl: session.serviceUrl,
+  });
+
+  if (!next) {
+    throw new Error("Failed to persist refreshed Bluesky session");
+  }
+
+  return next;
+}
+
+async function blueskyJsonRequest<T>(session: OperatorSession, path: string, init: RequestInit, allowRefresh = true): Promise<{ session: OperatorSession; payload: T }> {
+  const execute = async (activeSession: OperatorSession): Promise<{ response: Response; text: string; session: OperatorSession }> => {
+    const headers = new Headers(init.headers ?? {});
+    headers.set("Authorization", `Bearer ${activeSession.accessJwt}`);
+    if (!headers.has("Accept")) {
+      headers.set("Accept", "application/json");
+    }
+
+    const response = await fetch(`${activeSession.serviceUrl}${path}`, {
+      ...init,
+      headers,
+    });
+    const text = await response.text();
+    return { response, text, session: activeSession };
+  };
+
+  const first = await execute(session);
+  if (first.response.ok) {
+    return { session: first.session, payload: JSON.parse(first.text) as T };
+  }
+
+  if (allowRefresh && isRefreshableBlueskyError(first.response.status, first.text)) {
+    const refreshed = await refreshOperatorSession(session);
+    const second = await execute(refreshed);
+    if (second.response.ok) {
+      return { session: second.session, payload: JSON.parse(second.text) as T };
+    }
+    throw new Error(`Bluesky request failed after refresh: ${second.response.status} ${second.text}`.trim());
+  }
+
+  throw new Error(`Bluesky request failed: ${first.response.status} ${first.text}`.trim());
+}
+
 let store: PostgresRadarStore | InMemoryRadarStore;
 const evidenceIndexes = new Map<string, EvidenceIndex>();
+let jetstreamService: JetstreamService | null = null;
+let operatorStore: OperatorStore;
+
+const MCP_SERVER_REGISTRY = [
+  { id: "proxx", label: "Proxx", description: "OpenAI-compatible research and model routing proxy", baseUrl: proxxBaseUrl, kind: "proxy" },
+  { id: "radar-mcp", label: "Threat Radar MCP", description: "Radar control plane and collection API", baseUrl: `${publicBaseUrl.toString().replace(/\/$/, "")}/mcp`, kind: "mcp" },
+  { id: "jetstream", label: "Jetstream Firehose", description: "Bluesky Jetstream rolling-window ingest", baseUrl: `${publicBaseUrl.toString().replace(/\/$/, "")}/api/jetstream/status`, kind: "stream" },
+  { id: "mnemosyne", label: "Mnemosyne", description: "Workspace file memory server", baseUrl: "http://127.0.0.1:4011", kind: "mcp" },
+  { id: "mcp-github", label: "GitHub MCP", description: "GitHub operations and review tools", baseUrl: "http://127.0.0.1:4012", kind: "mcp" },
+  { id: "mcp-process", label: "Process MCP", description: "Task runner/process control", baseUrl: "http://127.0.0.1:4013", kind: "mcp" },
+  { id: "mcp-devtools", label: "Devtools MCP", description: "Browser/devtools hooks", baseUrl: "http://127.0.0.1:4014", kind: "mcp" },
+  { id: "mcp-tdd", label: "TDD MCP", description: "Testing automation and coverage helpers", baseUrl: "http://127.0.0.1:4015", kind: "mcp" },
+  { id: "mcp-sandboxes", label: "Sandboxes MCP", description: "Sandbox execution utilities", baseUrl: "http://127.0.0.1:4016", kind: "mcp" },
+  { id: "mcp-ollama", label: "Ollama MCP", description: "Local model control and inference helpers", baseUrl: "http://127.0.0.1:4017", kind: "mcp" },
+  { id: "mcp-exec", label: "Exec MCP", description: "Workspace command execution", baseUrl: "http://127.0.0.1:4018", kind: "mcp" },
+] as const;
 
 type InMemoryRadarRecord = {
   radar: Radar;
@@ -243,6 +522,17 @@ class InMemoryRadarStore {
     const all = [...this.threads.values()];
     const filtered = radarId ? all.filter((t) => t.radar_id === radarId) : all;
     return filtered.sort((a, b) => b.timeline.last_updated.localeCompare(a.timeline.last_updated)).slice(0, limit);
+  }
+
+  async deleteThreadsByRadar(radarId: string): Promise<number> {
+    let deleted = 0;
+    for (const [threadId, thread] of this.threads.entries()) {
+      if (thread.radar_id === radarId) {
+        this.threads.delete(threadId);
+        deleted++;
+      }
+    }
+    return deleted;
   }
 
   async updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "summary" | "members" | "source_distribution" | "confidence" | "domain_tags" | "status">> & { last_updated?: string }): Promise<void> {
@@ -482,35 +772,7 @@ async function collectBlueskySignals(args: {
 
   const rawSignals = await collector.collectFromFeed(query);
 
-  let collected = 0;
-  let duplicates = 0;
-  for (const raw of rawSignals) {
-    const signal = normalize({
-      id: raw.id,
-      radar_id: radarId,
-      provenance: raw.provenance,
-      text: raw.text,
-      title: raw.title,
-      links: raw.links,
-      domain_tags: raw.domain_tags,
-      observed_at: raw.observed_at,
-      ingested_at: raw.ingested_at,
-      content_hash: raw.content_hash,
-      metadata: raw.metadata,
-    });
-
-    if (signal.content_hash) {
-      const existing = await store.findSignalByContentHash(signal.content_hash);
-      if (existing) {
-        duplicates++;
-        continue;
-      }
-    }
-    await store.createSignal(signal);
-    collected++;
-  }
-
-  return { collected, duplicates, total_fetched: rawSignals.length };
+  return persistCollectorSignals(rawSignals, radarId);
 }
 
 async function collectRedditSignals(args: {
@@ -535,32 +797,9 @@ async function collectRedditSignals(args: {
     });
 
     totalFetched += rawSignals.length;
-
-    for (const raw of rawSignals) {
-      const signal = normalize({
-        id: raw.id,
-        radar_id: radarId,
-        provenance: raw.provenance,
-        text: raw.text,
-        title: raw.title,
-        links: raw.links,
-        domain_tags: raw.domain_tags,
-        observed_at: raw.observed_at,
-        ingested_at: raw.ingested_at,
-        content_hash: raw.content_hash,
-        metadata: raw.metadata,
-      });
-
-      if (signal.content_hash) {
-        const existing = await store.findSignalByContentHash(signal.content_hash);
-        if (existing) {
-          totalDuplicates++;
-          continue;
-        }
-      }
-      await store.createSignal(signal);
-      totalCollected++;
-    }
+    const persisted = await persistCollectorSignals(rawSignals, radarId);
+    totalCollected += persisted.collected;
+    totalDuplicates += persisted.duplicates;
   }
 
   return {
@@ -570,7 +809,109 @@ async function collectRedditSignals(args: {
   };
 }
 
-async function clusterRadarSignals(radarId: string): Promise<{ threads_created: number; signal_count: number }> {
+async function collectWeaverSignals(args: {
+  baseUrl?: string;
+  domainAllowlist?: string[];
+  keywords?: string[];
+  domainSignalLimit?: number;
+  recentNodeLimit?: number;
+  graphNodeLimit?: number;
+  radarId?: string;
+}): Promise<{ collected: number; duplicates: number; total_fetched: number }> {
+  const collector = new WeaverCollector();
+  const rawSignals = await collector.collect(args);
+  return persistCollectorSignals(rawSignals, args.radarId);
+}
+
+function requireJetstreamService(): JetstreamService {
+  if (!jetstreamService) {
+    throw new Error("Jetstream integration is disabled; set REDIS_URL and enable JETSTREAM_ENABLED");
+  }
+  return jetstreamService;
+}
+
+async function listJetstreamRules(): Promise<JetstreamRule[]> {
+  return requireJetstreamService().listRules();
+}
+
+async function getJetstreamRule(radarId: string): Promise<JetstreamRule | null> {
+  return requireJetstreamService().getRule(radarId);
+}
+
+async function putJetstreamRule(radarId: string, input: JetstreamRuleInput): Promise<JetstreamRule> {
+  return requireJetstreamService().putRule(radarId, input);
+}
+
+async function deleteJetstreamRule(radarId: string): Promise<void> {
+  await requireJetstreamService().deleteRule(radarId);
+}
+
+async function collectJetstreamSignals(args: { radarId: string; limit?: number }): Promise<{ collected: number; duplicates: number; total_fetched: number }> {
+  const service = requireJetstreamService();
+  const rawSignals = await collectJetstreamWindowSignals(service, args.radarId, args.limit);
+  return persistCollectorSignals(rawSignals, args.radarId);
+}
+
+async function persistCollectorSignals(rawSignals: ReadonlyArray<RawCollectorOutput>, radarId?: string): Promise<{ collected: number; duplicates: number; total_fetched: number }> {
+  let collected = 0;
+  let duplicates = 0;
+
+  for (const raw of rawSignals) {
+    const signal = normalize({
+      ...raw,
+      radar_id: radarId ?? raw.radar_id,
+    });
+
+    if (signal.content_hash) {
+      const existing = await store.findSignalByContentHash(signal.content_hash);
+      if (existing) {
+        duplicates++;
+        continue;
+      }
+    }
+
+    await store.createSignal(signal);
+    collected++;
+  }
+
+  return { collected, duplicates, total_fetched: rawSignals.length };
+}
+
+function retitleCrawlerThreads(threads: ReadonlyArray<Thread>, signals: ReadonlyArray<SignalEvent>): Thread[] {
+  const signalById = new Map(signals.map((signal) => [signal.id, signal]));
+  const internalTags = new Set(["crawler", "weaver", "queued", "fetching", "fetched", "idle", "active"]);
+
+  return threads.map((thread) => {
+    const memberSignals = thread.members
+      .map((member) => signalById.get(member.signal_event_id))
+      .filter((signal): signal is SignalEvent => Boolean(signal));
+
+    if (memberSignals.length === 0) {
+      return thread;
+    }
+
+    const crawlerOnly = memberSignals.every((signal) => signal.domain_tags.includes("crawler"));
+    if (!crawlerOnly) {
+      return thread;
+    }
+
+    const watchDomains = [...new Set(memberSignals.flatMap((signal) => signal.domain_tags))]
+      .filter((tag) => !internalTags.has(tag))
+      .sort();
+
+    const title = watchDomains.length > 0
+      ? `Crawler watchlist activity: ${watchDomains.slice(0, 2).join(" + ")}`
+      : "Crawler watchlist activity";
+
+    return {
+      ...thread,
+      title,
+      summary: `Synthesized from ${memberSignals.length} crawler-derived signals across ${Math.max(1, watchDomains.length)} tracked watch domains.`,
+    };
+  });
+}
+
+async function clusterRadarSignals(radarId: string): Promise<{ threads_created: number; signal_count: number; threads_replaced: number }> {
   const radar = await store.getRadar(radarId);
   if (!radar) {
     throw new Error(`Unknown radar: ${radarId}`);
@@ -578,10 +919,11 @@ async function clusterRadarSignals(radarId: string): Promise<{ threads_created: 
 
   const signals = await store.listSignals(radarId);
   if (signals.length === 0) {
-    return { threads_created: 0, signal_count: 0 };
+    return { threads_created: 0, signal_count: 0, threads_replaced: 0 };
   }
 
-  const threads = cluster(signals);
+  const threadsReplaced = await store.deleteThreadsByRadar(radarId);
+  const threads = retitleCrawlerThreads(cluster(signals), signals);
   let created = 0;
   for (const thread of threads) {
     thread.radar_id = radarId;
@@ -589,7 +931,8 @@ async function clusterRadarSignals(radarId: string): Promise<{ threads_created: 
     created++;
   }
 
-  return { threads_created: created, signal_count: signals.length };
+  await store.createAuditEvent(radarId, "threads_reclustered", { threads_replaced: threadsReplaced, threads_created: created, signal_count: signals.length });
+  return { threads_created: created, signal_count: signals.length, threads_replaced: threadsReplaced };
 }
 
 const app = express();
@@ -610,11 +953,13 @@ const federationManager = new FederationManager({
 });
 
 app.get("/health", async (_req, res) => {
+  const jetstreamStatus = jetstreamService ? await jetstreamService.status() : { enabled: false };
   res.json({
     ok: true,
     service: "threat-radar-mcp",
     storage: usePostgres ? "postgres" : "memory",
     publicBaseUrl: publicBaseUrl.toString(),
+    jetstream: jetstreamStatus,
     federation: {
       instanceId: federationManager.getInstanceId(),
       peers: federationManager.listPeers().length,
@@ -764,20 +1109,33 @@ app.get("/api/radars", async (_req, res) => {
   const radars = await store.listRadars();
   const result = await Promise.all(radars.map(async (radar) => {
     const sources = await store.listSources(radar.id);
+    const signals = await store.listSignals(radar.id);
     const submissions = await store.listSubmissions(radar.id);
+    const latestSubmission = submissions[submissions.length - 1]?.packet;
     const liveSnapshot = await store.getLatestLiveSnapshot(radar.id);
     const latestDailySnapshot = await store.getLatestDailySnapshot(radar.id);
     const threads = await store.listThreads(radar.id);
     return {
       radar,
       sourceCount: sources.length,
+      signalCount: signals.length,
       submissionCount: submissions.length,
+      latestSubmission: latestSubmissionView(latestSubmission),
       liveSnapshot,
       latestDailySnapshot,
       threads,
     };
   }));
   res.json(result);
+});
+
+app.get("/api/signals", async (req, res) => {
+  const rawRadarId = req.query.radarId;
+  const rawLimit = req.query.limit;
+  const radarId = typeof rawRadarId === "string" && rawRadarId.trim().length > 0 ? rawRadarId.trim() : undefined;
+  const limit = Math.max(1, Math.min(500, Number(typeof rawLimit === "string" ? rawLimit : "200") || 200));
+  const signals = await store.listSignals(radarId, limit);
+  res.json(signals);
 });
 
 app.post("/api/radars", requireAdminKey, async (req, res) => {
@@ -798,6 +1156,296 @@ app.post("/api/radars/ensure", requireAdminKey, async (req, res) => {
     res.status(201).json({ ok: true, created: true, radar });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to ensure radar";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/jetstream/status", async (_req, res) => {
+  if (!jetstreamService) {
+    res.json({ ok: true, enabled: false });
+    return;
+  }
+  res.json({ ok: true, ...(await jetstreamService.status()) });
+});
+
+app.get("/api/jetstream/rules", requireAdminKey, async (_req, res) => {
+  try {
+    const rules = await listJetstreamRules();
+    res.json({ ok: true, rules });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to list Jetstream rules";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/jetstream/rules/:radarId", requireAdminKey, async (req, res) => {
+  try {
+    const rawRadarId = req.params.radarId;
+    const radarId = Array.isArray(rawRadarId) ? rawRadarId[0] ?? "" : rawRadarId;
+    const rule = await getJetstreamRule(radarId);
+    res.json({ ok: true, rule });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to fetch Jetstream rule";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.put("/api/jetstream/rules/:radarId", requireAdminKey, async (req, res) => {
+  try {
+    const rawRadarId = req.params.radarId;
+    const radarId = Array.isArray(rawRadarId) ? rawRadarId[0] ?? "" : rawRadarId;
+    const radar = await store.getRadar(radarId);
+    if (!radar) {
+      res.status(404).json({ ok: false, error: `Unknown radar: ${radarId}` });
+      return;
+    }
+    const body = z.object({
+      wantedUsers: z.array(z.string().min(1)).optional(),
+      wantedDids: z.array(z.string().min(1)).optional(),
+      hashtags: z.array(z.string().min(1)).optional(),
+      keywords: z.array(z.string().min(1)).optional(),
+      windowSeconds: z.number().int().min(60).max(604800).optional(),
+      maxEvents: z.number().int().min(10).max(2000).optional(),
+      enabled: z.boolean().optional(),
+      allowNetworkWide: z.boolean().optional(),
+    }).parse(req.body);
+    const rule = await putJetstreamRule(radarId, body);
+    res.json({ ok: true, rule });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to store Jetstream rule";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.delete("/api/jetstream/rules/:radarId", requireAdminKey, async (req, res) => {
+  try {
+    const rawRadarId = req.params.radarId;
+    const radarId = Array.isArray(rawRadarId) ? rawRadarId[0] ?? "" : rawRadarId;
+    await deleteJetstreamRule(radarId);
+    res.json({ ok: true, radarId });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to delete Jetstream rule";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/operator/auth/login", async (req, res) => {
+  try {
+    const body = z.object({
+      identifier: z.string().min(1),
+      appPassword: z.string().min(1),
+      serviceUrl: z.string().url().optional(),
+    }).parse(req.body);
+    const session = await loginWithBluesky(body.identifier, body.appPassword, body.serviceUrl);
+    res.json({
+      ok: true,
+      session: {
+        id: session.id,
+        did: session.did,
+        handle: session.handle,
+        serviceUrl: session.serviceUrl,
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Bluesky login failed";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/operator/auth/session", requireOperatorSession, async (req, res) => {
+  const session = operatorSessionOf(req);
+  res.json({
+    ok: true,
+    session: {
+      id: session.id,
+      did: session.did,
+      handle: session.handle,
+      serviceUrl: session.serviceUrl,
+    },
+  });
+});
+
+app.post("/api/operator/auth/logout", requireOperatorSession, async (req, res) => {
+  const session = operatorSessionOf(req);
+  await operatorStore.deleteSession(session.id);
+  res.json({ ok: true });
+});
+
+app.get("/api/operator/bluesky/timeline", requireOperatorSession, async (req, res) => {
+  try {
+    const session = operatorSessionOf(req);
+    const rawLimit = req.query.limit;
+    const limit = Math.max(1, Math.min(100, Number(typeof rawLimit === "string" ? rawLimit : "25") || 25));
+    const posts = await fetchBlueskyTimeline(session, limit);
+    res.json({ ok: true, posts });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to load Bluesky timeline";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/operator/drafts", requireOperatorSession, async (req, res) => {
+  const session = operatorSessionOf(req);
+  const drafts = await operatorStore.listDrafts(session.did);
+  res.json({ ok: true, drafts });
+});
+
+app.post("/api/operator/drafts", requireOperatorSession, async (req, res) => {
+  try {
+    const session = operatorSessionOf(req);
+    const body = z.object({
+      title: z.string().min(1),
+      text: z.string().min(1),
+    }).parse(req.body);
+    const draft = await operatorStore.upsertDraft({
+      did: session.did,
+      title: body.title,
+      text: body.text,
+    });
+    res.status(201).json({ ok: true, draft });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to create draft";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.put("/api/operator/drafts/:draftId", requireOperatorSession, async (req, res) => {
+  try {
+    const session = operatorSessionOf(req);
+    const rawDraftId = req.params.draftId;
+    const draftId = Array.isArray(rawDraftId) ? rawDraftId[0] ?? "" : rawDraftId;
+    const body = z.object({
+      title: z.string().min(1),
+      text: z.string().min(1),
+    }).parse(req.body);
+    const draft = await operatorStore.upsertDraft({
+      did: session.did,
+      draftId,
+      title: body.title,
+      text: body.text,
+    });
+    res.json({ ok: true, draft });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to update draft";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.delete("/api/operator/drafts/:draftId", requireOperatorSession, async (req, res) => {
+  const session = operatorSessionOf(req);
+  const rawDraftId = req.params.draftId;
+  const draftId = Array.isArray(rawDraftId) ? rawDraftId[0] ?? "" : rawDraftId;
+  await operatorStore.deleteDraft(session.did, draftId);
+  res.json({ ok: true, draftId });
+});
+
+app.post("/api/operator/publish/bluesky", requireOperatorSession, async (req, res) => {
+  try {
+    const session = operatorSessionOf(req);
+    const body = z.object({
+      text: z.string().min(1).max(300),
+      draftId: z.string().optional(),
+      title: z.string().optional(),
+    }).parse(req.body);
+    const published = await publishDraftToBluesky(session, body.text);
+    if (body.draftId) {
+      await operatorStore.upsertDraft({
+        did: session.did,
+        draftId: body.draftId,
+        title: body.title ?? body.text.slice(0, 48),
+        text: body.text,
+        status: "published",
+        lastPublishedUri: typeof published.uri === "string" ? published.uri : undefined,
+      });
+    }
+    res.json({ ok: true, published });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to publish post";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/operator/workspace", requireOperatorSession, async (req, res) => {
+  const session = operatorSessionOf(req);
+  const prefs = await operatorStore.getPrefs(session.did);
+  res.json({
+    ok: true,
+    workspace: {
+      proxxBaseUrl,
+      servers: MCP_SERVER_REGISTRY,
+      prefs,
+    },
+  });
+});
+
+app.put("/api/operator/workspace", requireOperatorSession, async (req, res) => {
+  try {
+    const session = operatorSessionOf(req);
+    const body = z.object({
+      enabledServerIds: z.array(z.string().min(1)).optional(),
+      proxxDocked: z.boolean().optional(),
+      objective: z.string().max(2000).optional(),
+      longTermObjective: z.string().max(2000).optional(),
+      strategicNotes: z.string().max(4000).optional(),
+      challengeMode: z.boolean().optional(),
+    }).parse(req.body);
+    const prefs = await operatorStore.setPrefs(session.did, body);
+    res.json({ ok: true, prefs });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to update workspace preferences";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.get("/api/operator/jetstream/rules/:radarId", requireOperatorSession, async (req, res) => {
+  try {
+    const rawRadarId = req.params.radarId;
+    const radarId = Array.isArray(rawRadarId) ? rawRadarId[0] ?? "" : rawRadarId;
+    const rule = await getJetstreamRule(radarId);
+    res.json({ ok: true, rule });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to load Jetstream rule";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.put("/api/operator/jetstream/rules/:radarId", requireOperatorSession, async (req, res) => {
+  try {
+    const rawRadarId = req.params.radarId;
+    const radarId = Array.isArray(rawRadarId) ? rawRadarId[0] ?? "" : rawRadarId;
+    const radar = await store.getRadar(radarId);
+    if (!radar) {
+      res.status(404).json({ ok: false, error: `Unknown radar: ${radarId}` });
+      return;
+    }
+    const body = z.object({
+      wantedUsers: z.array(z.string().min(1)).optional(),
+      wantedDids: z.array(z.string().min(1)).optional(),
+      hashtags: z.array(z.string().min(1)).optional(),
+      keywords: z.array(z.string().min(1)).optional(),
+      windowSeconds: z.number().int().min(60).max(604800).optional(),
+      maxEvents: z.number().int().min(10).max(2000).optional(),
+      enabled: z.boolean().optional(),
+      allowNetworkWide: z.boolean().optional(),
+    }).parse(req.body);
+    const rule = await putJetstreamRule(radarId, body);
+    res.json({ ok: true, rule });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to update Jetstream rule";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/operator/jetstream/collect", requireOperatorSession, async (req, res) => {
+  try {
+    const body = z.object({
+      radarId: z.string().min(1),
+      limit: z.number().int().min(1).max(2000).optional(),
+    }).parse(req.body);
+    const result = await collectJetstreamSignals(body);
+    res.json({ ok: true, ...result });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to collect Jetstream window";
     res.status(400).json({ ok: false, error: message });
   }
 });
@@ -886,6 +1534,39 @@ app.post("/api/collect/reddit", requireAdminKey, async (req, res) => {
   }
 });
 
+app.post("/api/collect/weaver", requireAdminKey, async (req, res) => {
+  try {
+    const body = z.object({
+      baseUrl: z.string().url().optional(),
+      domainAllowlist: z.array(z.string().min(1)).optional(),
+      keywords: z.array(z.string().min(1)).optional(),
+      domainSignalLimit: z.number().int().min(1).max(25).optional(),
+      recentNodeLimit: z.number().int().min(0).max(50).optional(),
+      graphNodeLimit: z.number().int().min(50).max(5000).optional(),
+      radarId: z.string().optional(),
+    }).parse(req.body);
+    const result = await collectWeaverSignals(body);
+    res.json({ ok: true, ...result });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Crawler collection failed";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/collect/jetstream", requireAdminKey, async (req, res) => {
+  try {
+    const body = z.object({
+      radarId: z.string().min(1),
+      limit: z.number().int().min(1).max(2000).optional(),
+    }).parse(req.body);
+    const result = await collectJetstreamSignals(body);
+    res.json({ ok: true, ...result });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Jetstream collection failed";
+    res.status(400).json({ ok: false, error: message });
+  }
+});
+
 app.post("/api/cluster/:radarId", requireAdminKey, async (req, res) => {
   try {
     const rawRadarId = req.params.radarId;
@@ -935,12 +1616,14 @@ server.registerTool(
       const radars = await store.listRadars();
       const list = await Promise.all(radars.map(async (radar) => {
         const sources = await store.listSources(radar.id);
+        const signals = await store.listSignals(radar.id);
         const submissions = await store.listSubmissions(radar.id);
         const liveSnapshot = await store.getLatestLiveSnapshot(radar.id);
         const dailySnapshots = await store.listDailySnapshots(radar.id);
         return {
           radar,
           sourceCount: sources.length,
+          signalCount: signals.length,
           submissionCount: submissions.length,
           hasLiveSnapshot: Boolean(liveSnapshot),
           dailySnapshotCount: dailySnapshots.length,
@@ -1120,9 +1803,111 @@ server.registerTool(
 );
 
 server.registerTool(
+  "radar_collect_weaver",
+  {
+    description: "Collect signals from the Fork Tales web graph weaver. Uses bounded crawler status/domain activity plus recent graph nodes filtered by allowed domains/keywords.",
+    inputSchema: {
+      baseUrl: z.string().url().optional().describe("Base URL for the weaver API, default http://127.0.0.1:8793"),
+      domainAllowlist: z.array(z.string().min(1)).optional().describe("Optional allowed hostnames/domains to keep the collector focused"),
+      keywords: z.array(z.string().min(1)).optional().describe("Optional case-insensitive keywords used to filter graph nodes"),
+      domainSignalLimit: z.number().int().min(1).max(25).optional().describe("Maximum number of per-domain activity signals"),
+      recentNodeLimit: z.number().int().min(0).max(50).optional().describe("Maximum number of recent graph-node signals"),
+      graphNodeLimit: z.number().int().min(50).max(5000).optional().describe("How many graph nodes to inspect from the weaver graph endpoint"),
+      radarId: z.string().optional().describe("Optional radar ID to associate collected signals with"),
+    },
+  },
+  async ({ baseUrl, domainAllowlist, keywords, domainSignalLimit, recentNodeLimit, graphNodeLimit, radarId }): Promise<CallToolResult> => {
+    try {
+      const result = await collectWeaverSignals({
+        baseUrl,
+        domainAllowlist,
+        keywords,
+        domainSignalLimit,
+        recentNodeLimit,
+        graphNodeLimit,
+        radarId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: true, ...result }) }],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Crawler collection failed";
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }) }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.registerTool(
+  "radar_set_jetstream_rule",
+  {
+    description: "Create or update a Jetstream firehose rule for a radar. Supports filtering by specific users/DIDs, hashtags, and keywords with a Redis-backed rolling window.",
+    inputSchema: {
+      radarId: z.string().min(1),
+      wantedUsers: z.array(z.string().min(1)).optional(),
+      wantedDids: z.array(z.string().min(1)).optional(),
+      hashtags: z.array(z.string().min(1)).optional(),
+      keywords: z.array(z.string().min(1)).optional(),
+      windowSeconds: z.number().int().min(60).max(604800).optional(),
+      maxEvents: z.number().int().min(10).max(2000).optional(),
+      enabled: z.boolean().optional(),
+      allowNetworkWide: z.boolean().optional(),
+    },
+  },
+  async ({ radarId, ...ruleInput }): Promise<CallToolResult> => {
+    try {
+      const radar = await store.getRadar(radarId);
+      if (!radar) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Unknown radar: ${radarId}` }) }],
+          isError: true,
+        };
+      }
+      const rule = await putJetstreamRule(radarId, ruleInput);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: true, rule }, null, 2) }],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to store Jetstream rule";
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }) }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.registerTool(
+  "radar_collect_jetstream",
+  {
+    description: "Collect normalized signals from the Redis-backed Jetstream rolling window for a radar.",
+    inputSchema: {
+      radarId: z.string().min(1),
+      limit: z.number().int().min(1).max(2000).optional(),
+    },
+  },
+  async ({ radarId, limit }): Promise<CallToolResult> => {
+    try {
+      const result = await collectJetstreamSignals({ radarId, limit });
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: true, ...result }, null, 2) }],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Jetstream collection failed";
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }) }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.registerTool(
   "radar_cluster_signals",
   {
-    description: "Explicitly cluster signals for a given radar into threads using TF-IDF cosine similarity. Runs normalize() on any un-normalized signals, then clusters all signals for the radar into Thread objects. Existing threads for the radar are preserved; new threads are added.",
+    description: "Explicitly cluster signals for a given radar into threads using TF-IDF cosine similarity. Existing radar threads are replaced before the new clustered thread set is written, preventing duplicate thread growth across recurring cycles.",
     inputSchema: {
       radarId: z.string().min(1).describe("The radar ID whose signals should be clustered"),
     },
@@ -1169,6 +1954,9 @@ app.delete("/mcp", maybeAdminBypass, async (req, res) => {
 });
 
 async function main(): Promise<void> {
+  operatorStore = new OperatorStore(ENV.REDIS_URL);
+  await operatorStore.init();
+
   if (usePostgres) {
     await initSchema();
     store = new PostgresRadarStore();
@@ -1177,6 +1965,18 @@ async function main(): Promise<void> {
     store = new InMemoryRadarStore();
     console.log("[threat-radar-mcp] in-memory storage (no DATABASE_URL)");
   }
+
+  if (jetstreamEnabled && ENV.REDIS_URL) {
+    jetstreamService = new JetstreamService({
+      redisUrl: ENV.REDIS_URL,
+      jetstreamUrl: ENV.JETSTREAM_URL,
+      atprotoService: ENV.ATPROTO_SERVICE,
+      logger: console,
+    });
+    await jetstreamService.ensureRunning();
+    console.log("[threat-radar-mcp] jetstream integration enabled");
+  }
+
   app.listen(ENV.PORT, "0.0.0.0", () => {
     console.log(`[threat-radar-mcp] listening on ${ENV.PORT}`);
   });
@@ -1185,4 +1985,20 @@ async function main(): Promise<void> {
 main().catch((err) => {
   console.error("[threat-radar-mcp] fatal:", err);
   process.exit(1);
+});
+
+process.on("SIGINT", () => {
+  void Promise.all([
+    closeSql(),
+    jetstreamService?.close(),
+    operatorStore?.close(),
+  ]).finally(() => process.exit(0));
+});
+
+process.on("SIGTERM", () => {
+  void Promise.all([
+    closeSql(),
+    jetstreamService?.close(),
+    operatorStore?.close(),
+  ]).finally(() => process.exit(0));
 });

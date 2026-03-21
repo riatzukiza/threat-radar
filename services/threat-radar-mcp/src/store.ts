@@ -572,6 +572,16 @@ export class PostgresRadarStore {
     return rows.map((r) => this.rowToThread(r));
   }
 
+  async deleteThreadsByRadar(radarId: string): Promise<number> {
+    const sql = getSql();
+    const rows = await sql<{ id: string }[]>`
+      DELETE FROM threads
+      WHERE radar_id = ${radarId}
+      RETURNING id
+    `;
+    return rows.length;
+  }
+
   async updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "summary" | "members" | "source_distribution" | "confidence" | "domain_tags" | "status">> & { last_updated?: string }): Promise<void> {
     const sql = getSql();
     const current = await this.getThread(threadId);
