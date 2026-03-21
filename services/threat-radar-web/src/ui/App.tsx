@@ -14,9 +14,13 @@ import { CriticalThinkingSection } from "./components/CriticalThinkingSection";
 import { ActionFeed } from "./components/ActionFeed";
 import { FirehosePanel } from "./components/FirehosePanel";
 import { HeroPanel } from "./components/HeroPanel";
+import { MissionBriefingPanel } from "./components/MissionBriefingPanel";
+import { OperatorDock } from "./components/OperatorDock";
+import { OperatorLoginGate } from "./components/OperatorLoginGate";
 import { useRadarPolling } from "../api/useRadarPolling";
 import { usePersonalization, applyWeights, computeCompositeScore } from "./hooks/usePersonalization";
 import { useEmbedding } from "../embed/useEmbedding";
+import { useOperatorSession } from "./hooks/useOperatorSession";
 import { isGlobalCategory, isLocalCategory } from "./lane-routing";
 import type { RadarTile, SignalData, BranchData } from "../api/types";
 
@@ -183,6 +187,7 @@ function LanePlaceholder({ message }: { message: string }) {
 
 export function App(): JSX.Element {
   const apiUrl = import.meta.env.VITE_API_URL ?? "";
+  const operator = useOperatorSession(apiUrl);
   const { tiles, loading, error, isStale, lastUpdated, refetch } = useRadarPolling(apiUrl);
   const { weights, toggles, setWeight, setToggle, resetToDefaults } = usePersonalization();
   const { state: embeddingState, computeSimilarity } = useEmbedding();
@@ -200,43 +205,64 @@ export function App(): JSX.Element {
     return snaps.reduce((a, b) => a + b, 0) / snaps.length;
   }, [globalTiles]);
 
+  if (operator.loading) {
+    return <div className="loading">Checking operator session…</div>;
+  }
+
+  if (!operator.session || !operator.sessionId) {
+    return <OperatorLoginGate onLogin={operator.login} error={operator.error} />;
+  }
+
   return (
-    <div className="dashboard-shell">
-      {/* Error banner — shown when API is unreachable */}
-      {error && (
-        <ErrorBanner
-          message={error}
-          isStale={isStale}
-          lastUpdated={lastUpdated}
-          onRetry={refetch}
-        />
-      )}
-
-      {/* Personalization Panel */}
-      <PersonalizationPanel
-        weights={weights}
-        toggles={toggles}
-        onWeightChange={setWeight}
-        onToggleChange={setToggle}
-        onReset={resetToDefaults}
+    <div className="dashboard-shell-with-dock">
+      <OperatorDock
+        apiUrl={apiUrl}
+        session={operator.session}
+        sessionId={operator.sessionId}
+        tiles={tiles}
+        onLogout={operator.logout}
       />
+      <div className="dashboard-shell">
+        {/* Error banner — shown when API is unreachable */}
+        {error && (
+          <ErrorBanner
+            message={error}
+            isStale={isStale}
+            lastUpdated={lastUpdated}
+            onRetry={refetch}
+          />
+        )}
 
-      {/* Hero Panel — aggregate ring gauges above the grid */}
-      {!loading && tiles.length > 0 && (
-        <HeroPanel tiles={tiles} />
-      )}
-      {/* Placeholder hero panel when loading or no data */}
-      {!loading && tiles.length === 0 && !error ? null : loading ? (
-        <HeroPanel tiles={[]} />
-      ) : null}
+        {/* Personalization Panel */}
+        <PersonalizationPanel
+          weights={weights}
+          toggles={toggles}
+          onWeightChange={setWeight}
+          onToggleChange={setToggle}
+          onReset={resetToDefaults}
+        />
 
-      {/* Main layout — show empty state or 3-lane grid */}
-      {!loading && tiles.length === 0 && !error ? (
-        <div className="dashboard-layout">
-          <EmptyState />
-        </div>
-      ) : (
-        <div className="dashboard-layout">
+        {/* Hero Panel — aggregate ring gauges above the grid */}
+        {!loading && tiles.length > 0 && (
+          <HeroPanel tiles={tiles} />
+        )}
+        <MissionBriefingPanel
+          apiUrl={apiUrl}
+          sessionId={operator.sessionId}
+          tiles={tiles}
+        />
+        {/* Placeholder hero panel when loading or no data */}
+        {!loading && tiles.length === 0 && !error ? null : loading ? (
+          <HeroPanel tiles={[]} />
+        ) : null}
+
+        {/* Main layout — show empty state or 3-lane grid */}
+        {!loading && tiles.length === 0 && !error ? (
+          <div className="dashboard-layout">
+            <EmptyState />
+          </div>
+        ) : (
+          <div className="dashboard-layout">
           {/* η (Global) Lane — Cyan */}
           <section className="lane lane-eta" style={{ "--lane-accent": "var(--cyan)", "--lane-accent-rgb": "34,211,238" } as React.CSSProperties}>
             <LaneHeader symbol={"\u03B7"} name="Global Forces" description="Things that affect you, outside your direct control" />
@@ -312,13 +338,14 @@ export function App(): JSX.Element {
               )}
             </div>
           </section>
-        </div>
-      )}
+          </div>
+        )}
 
-      {/* Firehose Panel — collapsible bottom panel with signal feed */}
-      {!loading && (
-        <FirehosePanel tiles={tiles} />
-      )}
+        {/* Firehose Panel — collapsible bottom panel with signal feed */}
+        {!loading && (
+          <FirehosePanel apiUrl={apiUrl} tiles={tiles} />
+        )}
+      </div>
     </div>
   );
 }

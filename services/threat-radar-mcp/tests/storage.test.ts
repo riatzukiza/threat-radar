@@ -275,6 +275,25 @@ describe("storage: thread CRUD", () => {
     expect(updated!.confidence).toBe(0.9);
   });
 
+  it("deletes existing threads for a radar before reclustering", async () => {
+    const t1 = makeThread({ radar_id: "radar-z" });
+    const t2 = makeThread({ radar_id: "radar-z" });
+    const t3 = makeThread({ radar_id: "radar-other" });
+    await store.createThread(t1);
+    await store.createThread(t2);
+    await store.createThread(t3);
+
+    const deleted = await store.deleteThreadsByRadar("radar-z");
+    expect(deleted).toBe(2);
+
+    const remainingRadarThreads = await store.listThreads("radar-z");
+    expect(remainingRadarThreads).toHaveLength(0);
+
+    const otherRadarThreads = await store.listThreads("radar-other");
+    expect(otherRadarThreads).toHaveLength(1);
+    expect(otherRadarThreads[0]?.id).toBe(t3.id);
+  });
+
   it("returns null for non-existent thread", async () => {
     const fetched = await store.getThread("nonexistent-id");
     expect(fetched).toBeNull();

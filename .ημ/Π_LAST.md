@@ -1,16 +1,19 @@
 # Π handoff
 
-- time: 2026-03-20T16:35:08Z
+- time: 2026-03-21T21:23:56Z
 - branch: main
-- pre-Π HEAD: 2bbf55c
-- Π HEAD: pending at capture time; resolved by the final git commit created after artifact assembly
+- pre-Π HEAD: b77c0bb
+- Π HEAD: pending at capture time; resolved by the final commit after artifact assembly
 
 ## Summary
-- Capture the current threat-radar MCP server changes in services/threat-radar-mcp/src/main.ts plus the new repo-level .dockerignore.
-- Record that services/threat-radar-mcp typecheck/build are green while the current Vitest suite is red on storage thread CRUD and signal auto-clustering expectations.
-- Publish a deterministic handoff snapshot anyway so the root workspace can point at the exact failing state for later fix-forward work.
+- Retire the obsolete Render deployment path by deleting stale render manifests and the broken MCP Dockerfile, and add README guidance that points live deployment authority at the Promethean runtime layer in devel.
+- Preserve the current world-interface refinement branch state while clarifying that this repo now serves as product/source code and not the canonical live deployment surface.
+
+## Notes
+- push branch: pi/fork-tax/2026-03-21-211345
+- origin remains origin/main; snapshot published on a dedicated Π branch plus tag while local main stays available for ongoing work.
 
 ## Verification
-- pass: services/threat-radar-mcp pnpm run typecheck
-- fail: services/threat-radar-mcp pnpm run test (81 pass, 2 fail: storage thread CRUD; signal auto-clustering)
-- pass: services/threat-radar-mcp pnpm run build
+- pass: pnpm --dir threat-radar-deploy --filter @riatzukiza/threat-radar-mcp build
+- pass: pnpm --dir threat-radar-deploy --filter @riatzukiza/threat-radar-web build
+- pass: pnpm --dir threat-radar-deploy --filter @riatzukiza/threat-radar-web test (313 passed; React act warnings only)

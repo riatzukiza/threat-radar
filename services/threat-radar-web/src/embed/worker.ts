@@ -13,6 +13,18 @@ import {
 import { cosineSimilarity, trigramSimilarityMatrix } from "@workspace/signal-embed-browser";
 
 let engine: BrowserEmbedEngine | null = null;
+const ONNX_ENABLED = import.meta.env.VITE_ENABLE_ONNX_EMBEDDING === "true";
+
+function trigramDiagnostics(): RuntimeDiagnostics {
+  return {
+    available_backends: ["trigram-cpu"],
+    active_backend: "trigram-cpu",
+    webnn_supported: false,
+    webgpu_supported: false,
+    wasm_supported: false,
+    device_preference: "auto",
+  };
+}
 
 export type WorkerRequest =
   | { type: "init"; config?: Partial<BrowserEmbedConfig> }
@@ -38,6 +50,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   try {
     switch (msg.type) {
       case "init": {
+        if (!ONNX_ENABLED) {
+          self.postMessage({ type: "init-ok", diagnostics: trigramDiagnostics() } satisfies WorkerResponse);
+          break;
+        }
+
         engine = new BrowserEmbedEngine(msg.config);
         try {
           const diagnostics = await engine.init();
