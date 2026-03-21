@@ -4,6 +4,18 @@ MCP control plane and REST API for the threat-radar platform — a news intellig
 
 Collects signals from Bluesky, Reddit, Jetstream-backed Bluesky firehose windows, and the Fork Tales crawler/weaver, normalizes and clusters them into threads, reduces assessment packets into live snapshots, and exposes everything via the MCP control plane plus a REST API.
 
+## Deployment status
+
+Render is retired for Threat Radar.
+
+The live `radar.promethean.rest` MCP/API deployment is Promethean-hosted from the parent `devel` workspace via:
+
+- `services/proxx/Caddyfile`
+- `services/radar-stack/docker-compose.yml`
+- `services/radar-stack/Dockerfile.threat-radar-mcp`
+
+This repo README covers local development and service behavior; it is not the canonical live deployment manifest.
+
 ## Setup
 
 ### Prerequisites
