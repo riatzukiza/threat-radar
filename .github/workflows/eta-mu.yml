@@ -68,7 +68,7 @@ jobs:
           cache-dependency-path: .eta-mu/pnpm-lock.yaml
 
       - name: Install eta-mu dependencies
-        run: pnpm --dir .eta-mu install --frozen-lockfile
+        run: pnpm --dir .eta-mu install --frozen-lockfile --ignore-workspace
 
       - name: Check eta-mu runtime credentials
         id: eta_mu_runtime
