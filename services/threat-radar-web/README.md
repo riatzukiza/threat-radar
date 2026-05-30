@@ -2,6 +2,18 @@
 
 React dashboard for the threat-radar platform — "Mission Control for the News." A three-lane intelligence display that expresses nuance, preserves user agency, and resists collapsing complex events into binary frames.
 
+## Deployment status
+
+Render is retired for Threat Radar.
+
+The live `radar.promethean.rest` web deployment is Promethean-hosted from the parent `devel` workspace via:
+
+- `services/proxx/Caddyfile`
+- `services/radar-stack/docker-compose.yml`
+- `services/radar-stack/Dockerfile.threat-radar-web`
+
+This README describes local development and the UI architecture; it is not the canonical live deployment manifest.
+
 ## Architecture
 
 Three-lane layout with animated visualizations:

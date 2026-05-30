@@ -80,9 +80,10 @@ export function useEmbedding(): UseEmbeddingResult {
 
         switch (msg.type) {
           case "init-ok": {
+            const onnxReady = !msg.diagnostics.active_backend.startsWith("trigram");
             setState({
               ready: true,
-              onnxReady: true,
+              onnxReady,
               activeBackend: msg.diagnostics.active_backend,
               diagnostics: msg.diagnostics,
               error: null,

@@ -1,300 +1,161 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import { FirehosePanel, tilesToFirehoseEntries, freshnessClass, relativeTime } from "../components/FirehosePanel";
-import type { RadarTile, ThreadData } from "../../api/types";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
+import { fetchSignalFeed } from "../../api/client";
+import type { RadarTile, SignalFeedItem } from "../../api/types";
+import { FirehosePanel, MAX_SIGNAL_FEED, freshnessClass, relativeTime, sourceLinksForSignal } from "../components/FirehosePanel";
 
-function makeThread(overrides: Partial<ThreadData> = {}): ThreadData {
-  return {
-    id: "thread-1",
-    radar_id: "radar-1",
-    kind: "event",
-    title: "Global Energy Disruption",
-    summary: "Multiple signals indicate infrastructure stress",
-    members: [
-      { signal_event_id: "sig-1", relevance: 0.9, added_at: "2024-01-01T00:00:00Z" },
-      { signal_event_id: "sig-2", relevance: 0.8, added_at: "2024-01-01T01:00:00Z" },
-    ],
-    source_distribution: { bluesky: 0.6, reddit: 0.4 },
-    confidence: 0.65,
-    timeline: {
-      first_seen: "2024-01-01T00:00:00Z",
-      last_updated: new Date().toISOString(),
-      peak_activity: "2024-01-01T06:00:00Z",
-    },
-    domain_tags: ["geopolitical", "infrastructure"],
-    status: "active",
-    ...overrides,
-  };
-}
+vi.mock("../../api/client", () => ({
+  fetchSignalFeed: vi.fn(),
+}));
 
-function makeTile(overrides: Partial<RadarTile> = {}, threadOverrides: Partial<ThreadData> = {}): RadarTile {
+const fetchSignalFeedMock = vi.mocked(fetchSignalFeed);
+
+function makeTile(id = "radar-1", name = "Hormuz Threat Clock"): RadarTile {
   return {
     radar: {
-      id: "radar-1",
-      slug: "energy-stress",
-      name: "Energy Stress Monitor",
+      id,
+      slug: id,
+      name,
       category: "geopolitical",
       status: "active",
     },
-    sourceCount: 3,
-    submissionCount: 5,
-    liveSnapshot: {
-      as_of_utc: "2024-01-01T12:00:00Z",
-      disagreement_index: 0.3,
-      quality_score: 0.7,
-      signals: {},
-      branches: [],
-      model_count: 2,
+    sourceCount: 0,
+    submissionCount: 1,
+    signalCount: 2,
+    threads: [],
+  };
+}
+
+function makeSignal(overrides: Partial<SignalFeedItem> = {}): SignalFeedItem {
+  return {
+    id: "sig-1",
+    radar_id: "radar-1",
+    provenance: {
+      source_type: "bluesky",
+      author: "operator.bsky.social",
+      post_uri: "at://did:plc:test/app.bsky.feed.post/3kabc",
+      confidence_class: "commentary",
+      retrieved_at: "2026-03-21T00:00:00.000Z",
     },
-    threads: [makeThread(threadOverrides)],
+    text: "Tanker insurance chatter is spiking after new regional warnings and shipping advisories.",
+    title: "Insurance chatter spike",
+    links: ["https://www.reuters.com/example-story"],
+    domain_tags: ["shipping", "insurance", "hormuz"],
+    observed_at: "2026-03-20T23:50:00.000Z",
+    ingested_at: new Date().toISOString(),
+    metadata: {
+      source_url: "https://www.iea.org/report/example",
+      score: 42,
+    },
+    category: "geopolitical",
+    quality_score: 0.82,
     ...overrides,
   };
 }
 
-// ---------------------------------------------------------------------------
-// tilesToFirehoseEntries — pure function tests
-// ---------------------------------------------------------------------------
-
-describe("tilesToFirehoseEntries", () => {
-  it("returns empty array when tiles have no threads", () => {
-    const tiles: RadarTile[] = [makeTile({ threads: undefined })];
-    expect(tilesToFirehoseEntries(tiles)).toHaveLength(0);
-  });
-
-  it("extracts entries from threads", () => {
-    const tiles = [makeTile()];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]!.title).toBe("Global Energy Disruption");
-    expect(entries[0]!.source).toBe("bluesky");
-    expect(entries[0]!.signalCount).toBe(2);
-    expect(entries[0]!.radarName).toBe("Energy Stress Monitor");
-  });
-
-  it("sorts entries by timestamp descending (most recent first)", () => {
-    const tiles = [
-      makeTile({
-        threads: [
-          makeThread({ id: "t1", timeline: { first_seen: "2024-01-01T00:00:00Z", last_updated: "2024-01-01T00:00:00Z" } }),
-          makeThread({ id: "t2", timeline: { first_seen: "2024-01-01T12:00:00Z", last_updated: "2024-01-02T00:00:00Z" } }),
-        ],
-      }),
-    ];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries).toHaveLength(2);
-    // t2 has later timestamp, should come first
-    expect(entries[0]!.id).toContain("t2");
-    expect(entries[1]!.id).toContain("t1");
-  });
-
-  it("classifies local_opportunity threads as actionable", () => {
-    const tiles = [makeTile({}, { kind: "local_opportunity" })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.classification).toBe("actionable");
-  });
-
-  it("classifies emerging threads as actionable", () => {
-    const tiles = [makeTile({}, { status: "emerging" })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.classification).toBe("actionable");
-  });
-
-  it("classifies high-confidence event threads as useful", () => {
-    const tiles = [makeTile({}, { kind: "event", confidence: 0.7, status: "active" })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.classification).toBe("useful");
-  });
-
-  it("classifies low-confidence threads as noise", () => {
-    const tiles = [makeTile({}, { kind: "narrative", confidence: 0.2, status: "archived" })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.classification).toBe("noise");
-  });
-
-  it("picks source with highest count from source_distribution", () => {
-    const tiles = [makeTile({}, { source_distribution: { reddit: 0.8, bluesky: 0.2 } })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.source).toBe("reddit");
-  });
-
-  it("includes domain tags from thread", () => {
-    const tiles = [makeTile({}, { domain_tags: ["energy", "climate", "security"] })];
-    const entries = tilesToFirehoseEntries(tiles);
-    expect(entries[0]!.tags).toEqual(["energy", "climate", "security"]);
-  });
+beforeEach(() => {
+  vi.clearAllMocks();
+  fetchSignalFeedMock.mockResolvedValue([]);
 });
-
-// ---------------------------------------------------------------------------
-// freshnessClass — pure function tests
-// ---------------------------------------------------------------------------
 
 describe("freshnessClass", () => {
-  it("returns 'fresh' for timestamps less than 30 minutes old", () => {
-    const recent = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 min ago
-    expect(freshnessClass(recent)).toBe("fresh");
+  it("returns fresh for recent timestamps", () => {
+    expect(freshnessClass(new Date(Date.now() - 5 * 60_000).toISOString())).toBe("fresh");
   });
 
-  it("returns 'aging' for timestamps between 30 min and 3 hours old", () => {
-    const aging = new Date(Date.now() - 90 * 60_000).toISOString(); // 1.5 hours ago
-    expect(freshnessClass(aging)).toBe("aging");
+  it("returns aging for mid-age timestamps", () => {
+    expect(freshnessClass(new Date(Date.now() - 90 * 60_000).toISOString())).toBe("aging");
   });
 
-  it("returns 'stale' for timestamps older than 3 hours", () => {
-    const stale = new Date(Date.now() - 240 * 60_000).toISOString(); // 4 hours ago
-    expect(freshnessClass(stale)).toBe("stale");
+  it("returns stale for old timestamps", () => {
+    expect(freshnessClass(new Date(Date.now() - 5 * 3600_000).toISOString())).toBe("stale");
   });
 });
-
-// ---------------------------------------------------------------------------
-// relativeTime — pure function tests
-// ---------------------------------------------------------------------------
 
 describe("relativeTime", () => {
-  it("returns 'just now' for very recent timestamps", () => {
-    const now = new Date().toISOString();
-    expect(relativeTime(now)).toBe("just now");
-  });
-
-  it("returns minutes format for timestamps < 1 hour", () => {
-    const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
-    expect(relativeTime(fiveMinAgo)).toBe("5m ago");
-  });
-
-  it("returns hours format for timestamps < 24 hours", () => {
-    const threeHoursAgo = new Date(Date.now() - 3 * 3600_000).toISOString();
-    expect(relativeTime(threeHoursAgo)).toBe("3h ago");
-  });
-
-  it("returns days format for timestamps >= 24 hours", () => {
-    const twoDaysAgo = new Date(Date.now() - 48 * 3600_000).toISOString();
-    expect(relativeTime(twoDaysAgo)).toBe("2d ago");
+  it("formats recent timestamps", () => {
+    expect(relativeTime(new Date(Date.now() - 4 * 60_000).toISOString())).toBe("4m ago");
   });
 });
 
-// ---------------------------------------------------------------------------
-// FirehosePanel component tests
-// ---------------------------------------------------------------------------
+describe("sourceLinksForSignal", () => {
+  it("converts Bluesky at:// URIs into browser links and preserves outbound links", () => {
+    const links = sourceLinksForSignal(makeSignal());
+    expect(links.some((link) => link.url === "https://bsky.app/profile/operator.bsky.social/post/3kabc")).toBe(true);
+    expect(links.some((link) => link.url === "https://www.reuters.com/example-story")).toBe(true);
+  });
+
+  it("deduplicates repeated links", () => {
+    const signal = makeSignal({
+      links: ["https://example.com/a", "https://example.com/a"],
+      metadata: { url: "https://example.com/a" },
+    });
+    const links = sourceLinksForSignal(signal);
+    expect(links.filter((link) => link.url === "https://example.com/a")).toHaveLength(1);
+  });
+});
 
 describe("FirehosePanel", () => {
-  it("renders without crashing", () => {
-    const { container } = render(<FirehosePanel tiles={[]} />);
-    expect(container.querySelector("[data-testid='firehose-panel']")).toBeTruthy();
-  });
+  it("loads and renders raw signals by default", async () => {
+    fetchSignalFeedMock.mockResolvedValue([makeSignal()]);
 
-  it("shows signal count in toggle bar", () => {
-    const tiles = [makeTile()];
-    render(<FirehosePanel tiles={tiles} />);
-    const count = screen.getByTestId("firehose-count");
-    expect(count.textContent).toBe("1 signal");
-  });
+    render(<FirehosePanel apiUrl="" tiles={[makeTile()]} />);
 
-  it("shows plural 'signals' for multiple entries", () => {
-    const tiles = [
-      makeTile({
-        threads: [
-          makeThread({ id: "t1" }),
-          makeThread({ id: "t2", title: "Second Thread" }),
-        ],
-      }),
-    ];
-    render(<FirehosePanel tiles={tiles} />);
-    const count = screen.getByTestId("firehose-count");
-    expect(count.textContent).toBe("2 signals");
-  });
-
-  it("starts collapsed by default", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    expect(screen.queryByTestId("firehose-body")).toBeNull();
-  });
-
-  it("expands when toggle is clicked", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    const toggle = screen.getByLabelText("Expand signal firehose");
-    fireEvent.click(toggle);
-    expect(screen.getByTestId("firehose-body")).toBeTruthy();
-  });
-
-  it("shows entries when expanded with data", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    const entries = screen.getAllByTestId("firehose-entry");
-    expect(entries.length).toBe(1);
-  });
-
-  it("shows firehose empty state when expanded with no signals", () => {
-    render(<FirehosePanel tiles={[]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("firehose-empty")).toBeTruthy();
-  });
-
-  it("shows empty state when tiles have no threads", () => {
-    render(<FirehosePanel tiles={[makeTile({ threads: undefined })]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("firehose-empty")).toBeTruthy();
-  });
-
-  it("renders freshness indicator for each entry", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("freshness-indicator")).toBeTruthy();
-  });
-
-  it("renders quality badge for each entry", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("quality-badge")).toBeTruthy();
-  });
-
-  it("renders classification tag for each entry", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("classification-tag")).toBeTruthy();
-  });
-
-  it("renders source badge for each entry", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    expect(screen.getByTestId("source-badge-bluesky")).toBeTruthy();
-  });
-
-  it("collapses when toggle is clicked again", () => {
-    render(<FirehosePanel tiles={[makeTile()]} />);
-    const toggle = screen.getByLabelText("Expand signal firehose");
-    fireEvent.click(toggle);
-    expect(screen.getByTestId("firehose-body")).toBeTruthy();
-    fireEvent.click(screen.getByLabelText("Collapse signal firehose"));
-    expect(screen.queryByTestId("firehose-body")).toBeNull();
-  });
-
-  it("shows freshness color coding: fresh (green) for new signals", () => {
-    const recentThread = makeThread({
-      timeline: { first_seen: "2024-01-01T00:00:00Z", last_updated: new Date().toISOString() },
+    await waitFor(() => {
+      expect(screen.getByText("Insurance chatter spike")).toBeInTheDocument();
     });
-    render(<FirehosePanel tiles={[makeTile({ threads: [recentThread] })]} />);
-    fireEvent.click(screen.getByLabelText("Expand signal firehose"));
-    const indicator = screen.getByTestId("freshness-indicator");
-    expect(indicator.className).toContain("fh-freshness-fresh");
-  });
-});
 
-// ---------------------------------------------------------------------------
-// Empty state for dashboard
-// ---------------------------------------------------------------------------
-
-describe("Dashboard empty state (in App)", () => {
-  // Note: testing the EmptyState is inline in App.tsx; we test via
-  // the data-testid attribute if the component renders it.
-  // Full integration tests are done via agent-browser.
-  it("tilesToFirehoseEntries handles empty tiles gracefully", () => {
-    expect(tilesToFirehoseEntries([])).toEqual([]);
+    expect(fetchSignalFeedMock).toHaveBeenCalledWith("", undefined, MAX_SIGNAL_FEED);
+    expect(screen.getByText("Insurance chatter spike")).toBeInTheDocument();
+    expect(screen.getAllByText("Hormuz Threat Clock").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("operator.bsky.social").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("tilesToFirehoseEntries handles tiles with empty thread arrays", () => {
-    const tiles = [makeTile({ threads: [] })];
-    expect(tilesToFirehoseEntries(tiles)).toEqual([]);
+  it("shows expandable source links and metadata", async () => {
+    fetchSignalFeedMock.mockResolvedValue([makeSignal()]);
+
+    render(<FirehosePanel apiUrl="" tiles={[makeTile()]} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Insurance chatter spike")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Insurance chatter spike"));
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("signal-link").length).toBeGreaterThanOrEqual(2);
+    });
+
+    expect(screen.getAllByText(/Tanker insurance chatter is spiking/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Inspect metadata")).toBeInTheDocument();
+  });
+
+  it("refetches when radar filter changes", async () => {
+    fetchSignalFeedMock.mockResolvedValue([]);
+
+    render(<FirehosePanel apiUrl="" tiles={[makeTile("radar-1", "Hormuz"), makeTile("radar-2", "Jetstream")]} />);
+
+    await waitFor(() => {
+      expect(fetchSignalFeedMock).toHaveBeenCalledWith("", undefined, MAX_SIGNAL_FEED);
+    });
+
+    fireEvent.change(screen.getByTestId("firehose-radar-filter"), {
+      target: { value: "radar-2" },
+    });
+
+    await waitFor(() => {
+      expect(fetchSignalFeedMock).toHaveBeenLastCalledWith("", "radar-2", MAX_SIGNAL_FEED);
+    });
+  });
+
+  it("shows an empty state when no raw signals are available", async () => {
+    fetchSignalFeedMock.mockResolvedValue([]);
+
+    render(<FirehosePanel apiUrl="" tiles={[makeTile()]} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("firehose-empty")).toBeInTheDocument();
+    });
   });
 });

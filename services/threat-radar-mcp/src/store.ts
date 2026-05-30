@@ -486,6 +486,14 @@ export class PostgresRadarStore {
     return rows.map((r) => this.rowToSignal(r));
   }
 
+  async countSignals(radarId?: string): Promise<number> {
+    const sql = getSql();
+    const rows = radarId
+      ? await sql<{ count: string }[]>`SELECT COUNT(*)::text AS count FROM signals WHERE radar_id = ${radarId}`
+      : await sql<{ count: string }[]>`SELECT COUNT(*)::text AS count FROM signals`;
+    return Number(rows[0]?.count ?? 0);
+  }
+
   async updateSignal(signalId: string, updates: Partial<Pick<SignalEvent, "radar_id" | "domain_tags" | "metadata">>): Promise<void> {
     const sql = getSql();
     const current = await this.getSignal(signalId);
@@ -570,6 +578,50 @@ export class PostgresRadarStore {
           ORDER BY last_updated DESC LIMIT ${limit}
         `;
     return rows.map((r) => this.rowToThread(r));
+  }
+
+  async deleteThreadsByRadar(radarId: string): Promise<number> {
+    const sql = getSql();
+    const rows = await sql<{ id: string }[]>`
+      DELETE FROM threads
+      WHERE radar_id = ${radarId}
+      RETURNING id
+    `;
+    return rows.length;
+  }
+
+  async replaceThreadsByRadar(radarId: string, threads: Thread[]): Promise<number> {
+    const sql = getSql();
+    const result = await sql.begin(async (tx) => {
+      const trx = tx as unknown as ReturnType<typeof getSql>;
+      const deleted = await trx<{ id: string }[]>`
+        DELETE FROM threads
+        WHERE radar_id = ${radarId}
+        RETURNING id
+      `;
+      for (const thread of threads) {
+        await trx`
+          INSERT INTO threads (id, radar_id, kind, title, summary, members, source_distribution, confidence, first_seen, last_updated, peak_activity, domain_tags, status)
+          VALUES (
+            ${thread.id},
+            ${radarId},
+            ${thread.kind},
+            ${thread.title},
+            ${thread.summary ?? null},
+            ${JSON.stringify(thread.members)}::jsonb,
+            ${JSON.stringify(thread.source_distribution)}::jsonb,
+            ${thread.confidence},
+            ${thread.timeline.first_seen},
+            ${thread.timeline.last_updated},
+            ${thread.timeline.peak_activity ?? null},
+            ${JSON.stringify(thread.domain_tags)}::jsonb,
+            ${thread.status}
+          )
+        `;
+      }
+      return deleted.length;
+    });
+    return result;
   }
 
   async updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "summary" | "members" | "source_distribution" | "confidence" | "domain_tags" | "status">> & { last_updated?: string }): Promise<void> {
