@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 
 import cors from "cors";
 import express, { type RequestHandler } from "express";
@@ -60,6 +61,60 @@ const publicBaseUrl = new URL(ENV.PUBLIC_BASE_URL ?? process.env.RENDER_EXTERNAL
 const usePostgres = Boolean(ENV.DATABASE_URL);
 const jetstreamEnabled = toBool(ENV.JETSTREAM_ENABLED, true) && Boolean(ENV.REDIS_URL);
 const proxxBaseUrl = ENV.PROXX_BASE_URL ?? "https://ussy.promethean.rest";
+const BLUESKY_FETCH_TIMEOUT_MS = 15_000;
+
+function isPrivateOrLocalHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  const ipKind = isIP(host);
+  if (ipKind === 4) {
+    const parts = host.split(".").map((part) => Number(part));
+    const [a, b] = parts;
+    return a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b !== undefined && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || a === 0;
+  }
+  if (ipKind === 6) {
+    return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
+  }
+  return !host.includes(".");
+}
+
+function validateAtprotoServiceUrl(raw?: string): string {
+  const parsed = new URL((raw?.trim() || "https://bsky.social"));
+  if (parsed.protocol !== "https:") {
+    throw new Error("ATProto service URL must use https");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("ATProto service URL must not include credentials, query, or fragment");
+  }
+  if (isPrivateOrLocalHost(parsed.hostname)) {
+    throw new Error("ATProto service URL must not target local or private hosts");
+  }
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return parsed.toString().replace(/\/$/, "");
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = BLUESKY_FETCH_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromCaller = (): void => controller.abort();
+  init.signal?.addEventListener?.("abort", abortFromCaller, { once: true });
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    init.signal?.removeEventListener?.("abort", abortFromCaller);
+    clearTimeout(timer);
+  }
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -142,8 +197,8 @@ function operatorSessionOf(req: express.Request): OperatorSession {
 }
 
 async function loginWithBluesky(identifier: string, password: string, serviceUrl?: string): Promise<OperatorSession> {
-  const service = (serviceUrl?.trim() || "https://bsky.social").replace(/\/$/, "");
-  const response = await fetch(`${service}/xrpc/com.atproto.server.createSession`, {
+  const service = validateAtprotoServiceUrl(serviceUrl);
+  const response = await fetchWithTimeout(`${service}/xrpc/com.atproto.server.createSession`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ identifier, password }),
@@ -278,7 +333,8 @@ async function refreshOperatorSession(session: OperatorSession): Promise<Operato
     throw new Error("Bluesky session expired and no refresh token is available");
   }
 
-  const response = await fetch(`${session.serviceUrl}/xrpc/com.atproto.server.refreshSession`, {
+  const service = validateAtprotoServiceUrl(session.serviceUrl);
+  const response = await fetchWithTimeout(`${service}/xrpc/com.atproto.server.refreshSession`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${session.refreshJwt}`,
@@ -303,7 +359,7 @@ async function refreshOperatorSession(session: OperatorSession): Promise<Operato
     refreshJwt: payload.refreshJwt ?? session.refreshJwt,
     did: payload.did ?? session.did,
     handle: payload.handle ?? session.handle,
-    serviceUrl: session.serviceUrl,
+    serviceUrl: service,
   });
 
   if (!next) {
@@ -321,7 +377,8 @@ async function blueskyJsonRequest<T>(session: OperatorSession, path: string, ini
       headers.set("Accept", "application/json");
     }
 
-    const response = await fetch(`${activeSession.serviceUrl}${path}`, {
+    const service = validateAtprotoServiceUrl(activeSession.serviceUrl);
+    const response = await fetchWithTimeout(`${service}${path}`, {
       ...init,
       headers,
     });
@@ -494,6 +551,11 @@ class InMemoryRadarStore {
     return filtered.sort((a, b) => b.ingested_at.localeCompare(a.ingested_at)).slice(0, limit);
   }
 
+  async countSignals(radarId?: string): Promise<number> {
+    if (!radarId) return this.signals.size;
+    return [...this.signals.values()].filter((signal) => signal.radar_id === radarId).length;
+  }
+
   async updateSignal(signalId: string, updates: Partial<Pick<SignalEvent, "radar_id" | "domain_tags" | "metadata">>): Promise<void> {
     const existing = this.signals.get(signalId);
     if (existing) {
@@ -533,6 +595,14 @@ class InMemoryRadarStore {
       }
     }
     return deleted;
+  }
+
+  async replaceThreadsByRadar(radarId: string, threads: Thread[]): Promise<number> {
+    const replaced = await this.deleteThreadsByRadar(radarId);
+    for (const thread of threads) {
+      this.threads.set(thread.id, { ...thread, radar_id: radarId });
+    }
+    return replaced;
   }
 
   async updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "summary" | "members" | "source_distribution" | "confidence" | "domain_tags" | "status">> & { last_updated?: string }): Promise<void> {
@@ -810,7 +880,6 @@ async function collectRedditSignals(args: {
 }
 
 async function collectWeaverSignals(args: {
-  baseUrl?: string;
   domainAllowlist?: string[];
   keywords?: string[];
   domainSignalLimit?: number;
@@ -922,14 +991,12 @@ async function clusterRadarSignals(radarId: string): Promise<{ threads_created: 
     return { threads_created: 0, signal_count: 0, threads_replaced: 0 };
   }
 
-  const threadsReplaced = await store.deleteThreadsByRadar(radarId);
-  const threads = retitleCrawlerThreads(cluster(signals), signals);
-  let created = 0;
-  for (const thread of threads) {
-    thread.radar_id = radarId;
-    await store.createThread(thread);
-    created++;
-  }
+  const threads = retitleCrawlerThreads(cluster(signals), signals).map((thread) => ({
+    ...thread,
+    radar_id: radarId,
+  }));
+  const threadsReplaced = await store.replaceThreadsByRadar(radarId, threads);
+  const created = threads.length;
 
   await store.createAuditEvent(radarId, "threads_reclustered", { threads_replaced: threadsReplaced, threads_created: created, signal_count: signals.length });
   return { threads_created: created, signal_count: signals.length, threads_replaced: threadsReplaced };
@@ -1073,7 +1140,7 @@ app.post("/api/federation/broadcast", requireAdminKey, async (req, res) => {
 
     const liveSnapshot = await store.getLatestLiveSnapshot(body.radarId);
     const threads = await store.listThreads(body.radarId);
-    const signals = await store.listSignals(body.radarId);
+    const signalCount = await store.countSignals(body.radarId);
 
     const renderState = liveSnapshot?.render_state as Record<string, unknown> | undefined;
     const deterministicSnapshot = renderState?.deterministicSnapshot as {
@@ -1091,7 +1158,7 @@ app.post("/api/federation/broadcast", requireAdminKey, async (req, res) => {
         snapshotKind: "live",
         asOfUtc: liveSnapshot?.as_of_utc ?? new Date().toISOString(),
         threadCount: threads.length,
-        signalCount: signals.length,
+        signalCount,
       },
       deterministicSnapshot,
     );
@@ -1109,7 +1176,7 @@ app.get("/api/radars", async (_req, res) => {
   const radars = await store.listRadars();
   const result = await Promise.all(radars.map(async (radar) => {
     const sources = await store.listSources(radar.id);
-    const signals = await store.listSignals(radar.id);
+    const signalCount = await store.countSignals(radar.id);
     const submissions = await store.listSubmissions(radar.id);
     const latestSubmission = submissions[submissions.length - 1]?.packet;
     const liveSnapshot = await store.getLatestLiveSnapshot(radar.id);
@@ -1118,7 +1185,7 @@ app.get("/api/radars", async (_req, res) => {
     return {
       radar,
       sourceCount: sources.length,
-      signalCount: signals.length,
+      signalCount,
       submissionCount: submissions.length,
       latestSubmission: latestSubmissionView(latestSubmission),
       liveSnapshot,
@@ -1537,7 +1604,6 @@ app.post("/api/collect/reddit", requireAdminKey, async (req, res) => {
 app.post("/api/collect/weaver", requireAdminKey, async (req, res) => {
   try {
     const body = z.object({
-      baseUrl: z.string().url().optional(),
       domainAllowlist: z.array(z.string().min(1)).optional(),
       keywords: z.array(z.string().min(1)).optional(),
       domainSignalLimit: z.number().int().min(1).max(25).optional(),
@@ -1616,14 +1682,14 @@ server.registerTool(
       const radars = await store.listRadars();
       const list = await Promise.all(radars.map(async (radar) => {
         const sources = await store.listSources(radar.id);
-        const signals = await store.listSignals(radar.id);
+        const signalCount = await store.countSignals(radar.id);
         const submissions = await store.listSubmissions(radar.id);
         const liveSnapshot = await store.getLatestLiveSnapshot(radar.id);
         const dailySnapshots = await store.listDailySnapshots(radar.id);
         return {
           radar,
           sourceCount: sources.length,
-          signalCount: signals.length,
+          signalCount,
           submissionCount: submissions.length,
           hasLiveSnapshot: Boolean(liveSnapshot),
           dailySnapshotCount: dailySnapshots.length,
@@ -1807,7 +1873,6 @@ server.registerTool(
   {
     description: "Collect signals from the Fork Tales web graph weaver. Uses bounded crawler status/domain activity plus recent graph nodes filtered by allowed domains/keywords.",
     inputSchema: {
-      baseUrl: z.string().url().optional().describe("Base URL for the weaver API, default http://127.0.0.1:8793"),
       domainAllowlist: z.array(z.string().min(1)).optional().describe("Optional allowed hostnames/domains to keep the collector focused"),
       keywords: z.array(z.string().min(1)).optional().describe("Optional case-insensitive keywords used to filter graph nodes"),
       domainSignalLimit: z.number().int().min(1).max(25).optional().describe("Maximum number of per-domain activity signals"),
@@ -1816,10 +1881,9 @@ server.registerTool(
       radarId: z.string().optional().describe("Optional radar ID to associate collected signals with"),
     },
   },
-  async ({ baseUrl, domainAllowlist, keywords, domainSignalLimit, recentNodeLimit, graphNodeLimit, radarId }): Promise<CallToolResult> => {
+  async ({ domainAllowlist, keywords, domainSignalLimit, recentNodeLimit, graphNodeLimit, radarId }): Promise<CallToolResult> => {
     try {
       const result = await collectWeaverSignals({
-        baseUrl,
         domainAllowlist,
         keywords,
         domainSignalLimit,

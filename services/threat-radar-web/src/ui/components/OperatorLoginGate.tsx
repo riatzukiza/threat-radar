@@ -46,7 +46,7 @@ export function OperatorLoginGate({ onLogin, error }: OperatorLoginGateProps): J
             <span>Service URL</span>
             <input value={serviceUrl} onChange={(event) => setServiceUrl(event.target.value)} placeholder="https://bsky.social" />
           </label>
-          {(localError || error) && <div className="operator-login-error">{localError || error}</div>}
+          {(localError || error) && <div className="operator-login-error" role="alert" aria-live="assertive">{localError || error}</div>}
           <button className="operator-button operator-button-primary" type="submit" disabled={submitting}>
             {submitting ? "Signing in…" : "Enter mission control"}
           </button>

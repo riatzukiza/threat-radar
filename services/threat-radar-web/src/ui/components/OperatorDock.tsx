@@ -149,32 +149,48 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, onLogout }: Op
 
   useEffect(() => {
     if (!selectedRadarId) return;
+    let cancelled = false;
+    setRule({ enabled: true, wantedDids: [session.did], windowSeconds: 3600, maxEvents: 250, allowNetworkWide: false });
     void fetchJetstreamRule(apiUrl, sessionId, selectedRadarId)
       .then((nextRule) => {
+        if (cancelled) return;
         if (nextRule) {
           setRule(nextRule);
         } else {
           setRule({ enabled: true, wantedDids: [session.did], windowSeconds: 3600, maxEvents: 250, allowNetworkWide: false });
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) setRule({ enabled: true, wantedDids: [session.did], windowSeconds: 3600, maxEvents: 250, allowNetworkWide: false });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [apiUrl, selectedRadarId, session.did, sessionId]);
 
   const saveDraft = async (): Promise<void> => {
     if (!draftTitle.trim() || !draftText.trim()) return;
-    const nextDraft = activeDraftId
-      ? await updateDraft(apiUrl, sessionId, activeDraftId, draftTitle, draftText)
-      : await createDraft(apiUrl, sessionId, draftTitle, draftText);
-    setStatusMessage(`Draft saved: ${nextDraft.title}`);
-    setActiveDraftId(nextDraft.id);
-    setDrafts(await fetchDrafts(apiUrl, sessionId));
+    try {
+      const nextDraft = activeDraftId
+        ? await updateDraft(apiUrl, sessionId, activeDraftId, draftTitle, draftText)
+        : await createDraft(apiUrl, sessionId, draftTitle, draftText);
+      setStatusMessage(`Draft saved: ${nextDraft.title}`);
+      setActiveDraftId(nextDraft.id);
+      setDrafts(await fetchDrafts(apiUrl, sessionId));
+    } catch (err: unknown) {
+      setStatusMessage(err instanceof Error ? err.message : "Failed to save draft");
+    }
   };
 
   const publishCurrentDraft = async (): Promise<void> => {
     if (!draftText.trim()) return;
-    const published = await publishDraft(apiUrl, sessionId, draftText, activeDraftId ?? undefined, draftTitle || undefined);
-    setStatusMessage(`Published to Bluesky: ${String(published.uri ?? "ok")}`);
-    setDrafts(await fetchDrafts(apiUrl, sessionId));
+    try {
+      const published = await publishDraft(apiUrl, sessionId, draftText, activeDraftId ?? undefined, draftTitle || undefined);
+      setStatusMessage(`Published to Bluesky: ${String(published.uri ?? "ok")}`);
+      setDrafts(await fetchDrafts(apiUrl, sessionId));
+    } catch (err: unknown) {
+      setStatusMessage(err instanceof Error ? err.message : "Failed to publish draft");
+    }
   };
 
   return (
@@ -339,8 +355,8 @@ export function OperatorDock({ apiUrl, session, sessionId, tiles, onLogout }: Op
         <label><span>Title</span><input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} placeholder="Threat clock update" /></label>
         <label><span>Text</span><textarea value={draftText} onChange={(event) => setDraftText(event.target.value)} rows={6} maxLength={300} placeholder="Draft your post…" /></label>
         <div className="operator-actions-row">
-          <button className="operator-button operator-button-primary" onClick={() => void saveDraft()}>Save draft</button>
-          <button className="operator-button" onClick={() => void publishCurrentDraft()}>Post to Bluesky</button>
+          <button className="operator-button operator-button-primary" onClick={() => { void saveDraft(); }}>Save draft</button>
+          <button className="operator-button" onClick={() => { void publishCurrentDraft(); }}>Post to Bluesky</button>
         </div>
         <div className="operator-draft-list">
           {drafts.map((draft) => (

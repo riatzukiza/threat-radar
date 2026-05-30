@@ -252,6 +252,9 @@ export class JetstreamService {
     const RedisCtor = RedisConstructor as unknown as { new(url: string, options: Record<string, unknown>): any };
     this.redis = new RedisCtor(options.redisUrl, { lazyConnect: true, maxRetriesPerRequest: 3 });
     this.logger = options.logger ?? console;
+    this.redis.on?.("error", (error: unknown) => {
+      this.logger.warn(`[jetstream] redis error: ${error instanceof Error ? error.message : String(error)}`);
+    });
     this.jetstreamUrl = options.jetstreamUrl ?? DEFAULT_JETSTREAM_URL;
     this.agent = new AtpAgent({ service: options.atprotoService ?? DEFAULT_ATPROTO_SERVICE });
   }

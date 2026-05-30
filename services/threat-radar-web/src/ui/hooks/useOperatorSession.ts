@@ -21,23 +21,37 @@ export function useOperatorSession(apiUrl: string): OperatorAuthState {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setSession(null);
+    setSessionId(null);
     const saved = window.localStorage.getItem(STORAGE_KEY);
     if (!saved) {
       setLoading(false);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
     setSessionId(saved);
     void fetchOperatorSession(apiUrl, saved)
       .then((nextSession) => {
+        if (cancelled) return;
         setSession(nextSession);
         setError(null);
       })
       .catch(() => {
+        if (cancelled) return;
         window.localStorage.removeItem(STORAGE_KEY);
         setSessionId(null);
         setSession(null);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [apiUrl]);
 
   const login = useCallback(async (identifier: string, appPassword: string, serviceUrl?: string) => {

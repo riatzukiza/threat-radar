@@ -78,6 +78,9 @@ export class OperatorStore {
     if (redisUrl) {
       const RedisCtor = RedisConstructor as unknown as { new(url: string, options: Record<string, unknown>): any };
       this.redis = new RedisCtor(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 3 });
+      this.redis.on?.("error", (error: unknown) => {
+        console.warn(`[operator-store] redis error: ${error instanceof Error ? error.message : String(error)}`);
+      });
     } else {
       this.redis = null;
     }

@@ -83,7 +83,11 @@ async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit): Promi
     const message = await res.text().catch(() => "");
     throw new ApiError(message || `API returned HTTP ${res.status}`, res.status);
   }
-  return res.json() as Promise<T>;
+  try {
+    return await res.json() as T;
+  } catch {
+    throw new ApiError("Failed to parse API response", res.status);
+  }
 }
 
 export async function loginOperator(apiUrl: string, identifier: string, appPassword: string, serviceUrl?: string): Promise<OperatorSession> {

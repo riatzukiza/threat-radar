@@ -4,7 +4,7 @@
 // expandable metadata so the dashboard does not feel like an unexplained mock.
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchSignalFeed } from "../../api/client";
 import type { RadarTile, SignalFeedItem } from "../../api/types";
@@ -65,15 +65,26 @@ function hostLabel(url: string): string {
   }
 }
 
+function safeExternalUrl(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function sourceLinksForSignal(signal: SignalFeedItem): Array<{ label: string; url: string }> {
   const seen = new Set<string>();
   const results: Array<{ label: string; url: string }> = [];
 
   const push = (label: string, url: string | null | undefined): void => {
-    if (!url) return;
-    if (seen.has(url)) return;
-    seen.add(url);
-    results.push({ label, url });
+    const safeUrl = safeExternalUrl(url);
+    if (!safeUrl) return;
+    if (seen.has(safeUrl)) return;
+    seen.add(safeUrl);
+    results.push({ label, url: safeUrl });
   };
 
   const postUrl = toBrowserUrl(signal.provenance.post_uri, signal.provenance.author);
@@ -224,6 +235,7 @@ export function FirehosePanel({ apiUrl, tiles }: FirehosePanelProps): JSX.Elemen
   const [signals, setSignals] = useState<SignalFeedItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
 
   const radarOptions = useMemo(
     () => [{ id: "all", name: "All radars" }, ...tiles.map((tile) => ({ id: tile.radar.id, name: tile.radar.name }))],
@@ -236,6 +248,8 @@ export function FirehosePanel({ apiUrl, tiles }: FirehosePanelProps): JSX.Elemen
   );
 
   const loadSignals = useCallback(async () => {
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
     setLoading(true);
     try {
       const nextSignals = await fetchSignalFeed(
@@ -243,12 +257,14 @@ export function FirehosePanel({ apiUrl, tiles }: FirehosePanelProps): JSX.Elemen
         selectedRadarId === "all" ? undefined : selectedRadarId,
         MAX_SIGNAL_FEED,
       );
+      if (requestIdRef.current !== requestId) return;
       setSignals(nextSignals);
       setError(null);
     } catch (err: unknown) {
+      if (requestIdRef.current !== requestId) return;
       setError(err instanceof Error ? err.message : "Failed to load raw signal feed");
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [apiUrl, selectedRadarId]);
 
@@ -265,6 +281,7 @@ export function FirehosePanel({ apiUrl, tiles }: FirehosePanelProps): JSX.Elemen
     const interval = window.setInterval(() => void run(), REFRESH_INTERVAL_MS);
     return () => {
       disposed = true;
+      requestIdRef.current += 1;
       window.clearInterval(interval);
     };
   }, [collapsed, loadSignals]);

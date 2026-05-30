@@ -5,10 +5,10 @@ import type { RawCollectorOutput } from "@workspace/radar-core";
 export interface WeaverCollectorConfig {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }
 
 export interface WeaverQuery {
-  baseUrl?: string;
   domainAllowlist?: string[];
   keywords?: string[];
   domainSignalLimit?: number;
@@ -215,14 +215,16 @@ function makeNodeSignal(node: WeaverGraphNode): RawCollectorOutput {
 export class WeaverCollector {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(config?: WeaverCollectorConfig) {
     this.baseUrl = (config?.baseUrl ?? "http://127.0.0.1:8793").replace(/\/$/, "");
     this.fetchImpl = config?.fetchImpl ?? fetch;
+    this.timeoutMs = Math.max(250, Math.min(60_000, config?.timeoutMs ?? 10_000));
   }
 
   async collect(query: WeaverQuery = {}): Promise<RawCollectorOutput[]> {
-    const baseUrl = (query.baseUrl ?? this.baseUrl).replace(/\/$/, "");
+    const baseUrl = this.baseUrl;
     const domainAllowlist = (query.domainAllowlist ?? []).map(normalizeHost).filter(Boolean);
     const keywords = (query.keywords ?? []).map(normalizeKeyword).filter(Boolean);
     const topicLabel = topicLabelFromKeywords(keywords);
@@ -272,10 +274,25 @@ export class WeaverCollector {
   }
 
   private async fetchJson<T>(url: string): Promise<T> {
-    const response = await this.fetchImpl(url);
-    if (!response.ok) {
-      throw new Error(`weaver request failed (${response.status}): ${url}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(url, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`weaver request failed (${response.status}): ${url}`);
+      }
+      const payload = await response.json() as T & { ok?: boolean; error?: string };
+      if (payload && typeof payload === "object" && payload.ok === false) {
+        throw new Error(`weaver request returned ok=false: ${payload.error ?? url}`);
+      }
+      return payload;
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`weaver request timed out after ${this.timeoutMs}ms: ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-    return response.json() as Promise<T>;
   }
 }

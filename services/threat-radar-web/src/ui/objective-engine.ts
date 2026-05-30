@@ -54,6 +54,32 @@ const LOCATION_LEXICON: ReadonlyArray<{ label: string; lat: number; lon: number;
   { label: "United States", lat: 39.8, lon: -98.6, aliases: ["united states", "u.s.", "usa", "washington"] },
 ];
 
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const LOCATION_ALIAS_MATCHERS = LOCATION_LEXICON
+  .flatMap((spec) => spec.aliases.map((alias) => ({ spec, alias })))
+  .sort((a, b) => b.alias.length - a.alias.length)
+  .map((entry) => ({
+    ...entry,
+    pattern: new RegExp(`(^|[^a-z0-9])${escapeRegExp(entry.alias)}($|[^a-z0-9])`, "i"),
+  }));
+
+function locationLabelsInText(text: string): string[] {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const matcher of LOCATION_ALIAS_MATCHERS) {
+    if (seen.has(matcher.spec.label)) continue;
+    if (matcher.pattern.test(text)) {
+      labels.push(matcher.spec.label);
+      seen.add(matcher.spec.label);
+    }
+  }
+  return labels;
+}
+
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
@@ -156,12 +182,14 @@ export function buildNarrativeCandidates(args: {
   const groups = new Map<string, EvidenceDoc[]>();
 
   for (const doc of docs) {
-    const location = LOCATION_LEXICON.find((entry) => entry.aliases.some((alias) => doc.body.toLowerCase().includes(alias)))?.label;
+    const locations = locationLabelsInText(doc.body.toLowerCase());
     const term = topTerms(`${doc.title} ${doc.body} ${doc.tags.join(" ")}`, 1)[0] ?? doc.sourceType;
-    const key = `${location ?? "Global"}:${term}`;
-    const current = groups.get(key) ?? [];
-    current.push(doc);
-    groups.set(key, current);
+    for (const location of locations.length > 0 ? locations : ["Global"]) {
+      const key = `${location}:${term}`;
+      const current = groups.get(key) ?? [];
+      current.push(doc);
+      groups.set(key, current);
+    }
   }
 
   const candidates = [...groups.entries()].map(([key, group]) => {
@@ -203,16 +231,15 @@ export function extractGeoHotspots(signals: readonly SignalFeedItem[], posts: re
 
   for (const doc of docs) {
     const haystack = `${doc.title} ${doc.body}`.toLowerCase();
-    for (const spec of LOCATION_LEXICON) {
-      if (spec.aliases.some((alias) => haystack.includes(alias))) {
-        const current = hits.get(spec.label) ?? { spec, count: 0, examples: [] };
-        current.count += 1;
-        if (current.examples.length < 3) {
-          current.examples.push(doc.title);
-        }
-        hits.set(spec.label, current);
-        break;
+    for (const label of locationLabelsInText(haystack)) {
+      const spec = LOCATION_LEXICON.find((entry) => entry.label === label);
+      if (!spec) continue;
+      const current = hits.get(spec.label) ?? { spec, count: 0, examples: [] };
+      current.count += 1;
+      if (current.examples.length < 3) {
+        current.examples.push(doc.title);
       }
+      hits.set(spec.label, current);
     }
   }
 

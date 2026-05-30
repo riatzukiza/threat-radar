@@ -34,9 +34,19 @@ export function MissionBriefingPanel({ apiUrl, sessionId, tiles }: MissionBriefi
   const [posts, setPosts] = useState<BlueskyTimelinePost[]>([]);
 
   useEffect(() => {
-    void fetchWorkspaceConfig(apiUrl, sessionId).then(setWorkspace).catch(() => {});
-    void fetchSignalFeed(apiUrl, undefined, 120).then(setSignals).catch(() => {});
-    void fetchBlueskyTimeline(apiUrl, sessionId, 30).then(setPosts).catch(() => {});
+    let cancelled = false;
+    void fetchWorkspaceConfig(apiUrl, sessionId).then((value) => {
+      if (!cancelled) setWorkspace(value);
+    }).catch(() => {});
+    void fetchSignalFeed(apiUrl, undefined, 120).then((value) => {
+      if (!cancelled) setSignals(value);
+    }).catch(() => {});
+    void fetchBlueskyTimeline(apiUrl, sessionId, 30).then((value) => {
+      if (!cancelled) setPosts(value);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [apiUrl, sessionId]);
 
   const objective = workspace?.prefs.objective ?? "";

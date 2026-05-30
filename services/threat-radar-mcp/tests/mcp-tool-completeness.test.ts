@@ -339,7 +339,7 @@ async function startTestServer(): Promise<{ server: http.Server; close: () => Pr
     {
       description: "Collect signals from the Fork Tales web graph weaver.",
       inputSchema: {
-        baseUrl: z.string().optional(),
+        radarId: z.string().optional(),
         domainAllowlist: z.array(z.string().min(1)).optional(),
         keywords: z.array(z.string().min(1)).optional(),
         domainSignalLimit: z.number().int().min(1).max(25).optional(),
@@ -656,7 +656,7 @@ describe("mcp-tool-completeness: all 10 MCP tools", () => {
   // ── Tool 10: radar_collect_weaver ─────────────────────────────────────────
   it("mcp-tool: radar_collect_weaver returns well-formed response", async () => {
     const { result, isError } = await callTool(sessionId, "radar_collect_weaver", {
-      baseUrl: "http://127.0.0.1:8793",
+      radarId: "test-radar",
       domainAllowlist: ["iea.org"],
       keywords: ["hormuz"],
       recentNodeLimit: 2,
